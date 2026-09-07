@@ -25,18 +25,34 @@ def _table_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+# Internal-only provenance/identifier columns that must never leave the site raw.
+# `__source_resource_id` (added by viewdef.py so a projected row can be traced back to
+# its lossless FHIR record inside the site) is a bare source-system identifier -- for
+# the patient table it's literally the same value `id` holds, i.e. the un-tokenized
+# original sitting right next to its own token. `id` itself is excluded for every
+# domain, not just patient: this generator's resource-id scheme (stage1_synthea.py)
+# embeds the raw patient id as a substring in every child resource's id (e.g. a
+# Condition id like "synthetic-patient-00001-cond-484714"), so shipping it verbatim
+# re-exposes the exact identifier the token was supposed to replace -- confirmed by
+# inspecting actual packaged output, not assumed. Traceability for Req 6 is a
+# site-internal audit obligation (data/lake/raw/ + the stage 9 audit log already
+# provide it); it must not double as an outbound identifier.
+_INTERNAL_ONLY_COLUMNS = ("id", "__source_resource_id")
+
+
 def _apply_tokens(deid_dir: Path, token_map: dict[str, str], out_dir: Path) -> dict[str, int]:
-    """Replace patient_id / id with the OPPRL token; drop the raw internal key. [Req 4, 5]"""
+    """Replace patient_id / id with the OPPRL token; drop all raw internal keys. [Req 4, 5, 13]"""
     out_dir.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect()
     con.register("token_map", pa.Table.from_pylist([{"patient_id": k, "token": v} for k, v in token_map.items()]))
     counts = {}
+    internal_cols = ", ".join(_INTERNAL_ONLY_COLUMNS)
 
     patient_src = deid_dir / "patient.parquet"
     if patient_src.exists():
         out_path = out_dir / "patient.parquet"
         con.execute(
-            f"COPY (SELECT t.token AS subject_token, p.* EXCLUDE (id) "
+            f"COPY (SELECT t.token AS subject_token, p.* EXCLUDE ({internal_cols}) "
             f"FROM read_parquet('{patient_src.as_posix()}') p "
             f"JOIN token_map t ON p.id = t.patient_id) TO '{out_path.as_posix()}' (FORMAT parquet)"
         )
@@ -48,7 +64,7 @@ def _apply_tokens(deid_dir: Path, token_map: dict[str, str], out_dir: Path) -> d
             continue
         out_path = out_dir / f"{domain}.parquet"
         con.execute(
-            f"COPY (SELECT t.token AS subject_token, d.* EXCLUDE (patient_id) "
+            f"COPY (SELECT t.token AS subject_token, d.* EXCLUDE (patient_id, {internal_cols}) "
             f"FROM read_parquet('{src.as_posix()}') d JOIN token_map t ON d.patient_id = t.patient_id) "
             f"TO '{out_path.as_posix()}' (FORMAT parquet)"
         )

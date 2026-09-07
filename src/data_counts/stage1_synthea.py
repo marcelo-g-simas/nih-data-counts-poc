@@ -50,6 +50,18 @@ def _random_date(rng: random.Random, start: date, end: date) -> date:
     return start + timedelta(days=rng.randint(0, max(delta, 1)))
 
 
+def _opaque_id(rng: random.Random) -> str:
+    """A resource id with no relationship to any patient identifier.
+
+    122 bits (matching UUIDv4's entropy) rather than fewer: collision probability
+    is n^2/2N (birthday approximation), so at even 1M resources of one type --
+    far past this POC's scale -- p is still ~1e-19, vs. ~1 in 560 at 48 bits.
+    Drawn from the seeded `rng`, not `uuid.uuid4()`, to preserve the
+    same-input-same-seed reproducibility guarantee.
+    """
+    return f"{rng.getrandbits(122):031x}"
+
+
 def generate_synthetic_fallback(out_dir: Path, population: int, seed: int) -> dict[str, int]:
     """Deterministic pure-Python FHIR R4 cohort generator (no Java/Docker needed)."""
     rng = random.Random(seed)
@@ -81,7 +93,7 @@ def generate_synthetic_fallback(out_dir: Path, population: int, seed: int) -> di
                 onset = _random_date(rng, birth, date(2025, 12, 31))
                 condition = {
                     "resourceType": "Condition",
-                    "id": f"{pid}-cond-{rng.randint(0, 999999)}",
+                    "id": f"cond-{_opaque_id(rng)}",
                     "subject": {"reference": f"Patient/{pid}"},
                     "code": {"coding": [{"system": system, "code": code, "display": display}]},
                     "onsetDateTime": onset.isoformat(),
@@ -93,7 +105,14 @@ def generate_synthetic_fallback(out_dir: Path, population: int, seed: int) -> di
             for _ in range(n_enc):
                 start_dt = _random_date(rng, birth, date(2025, 12, 31))
                 end_dt = start_dt + timedelta(days=rng.randint(0, 2))
-                enc_id = f"{pid}-enc-{rng.randint(0, 999999)}"
+                # Opaque, patient-independent: FHIR resource ids are a distinct namespace
+                # from the patient identifier they reference, and (per Req 4/13) nothing
+                # in the de-identified/tokenized output path may recover a raw identifier
+                # by inspection -- a scheme like f"{pid}-enc-..." would leak exactly that,
+                # and downstream reference fields (e.g. Observation.encounter_id) would
+                # carry the leak forward. Confirmed necessary by finding it leak through
+                # to the packaged output before this fix.
+                enc_id = f"enc-{_opaque_id(rng)}"
                 encounter = {
                     "resourceType": "Encounter",
                     "id": enc_id,
@@ -107,7 +126,7 @@ def generate_synthetic_fallback(out_dir: Path, population: int, seed: int) -> di
                     system, code, display, unit = rng.choice(OBSERVATION_CODES)
                     obs = {
                         "resourceType": "Observation",
-                        "id": f"{enc_id}-obs-{rng.randint(0, 999999)}",
+                        "id": f"obs-{_opaque_id(rng)}",
                         "subject": {"reference": f"Patient/{pid}"},
                         "encounter": {"reference": f"Encounter/{enc_id}"},
                         "effectiveDateTime": start_dt.isoformat(),
@@ -121,7 +140,7 @@ def generate_synthetic_fallback(out_dir: Path, population: int, seed: int) -> di
                 system, code, display = rng.choice(MEDICATION_CODES)
                 med = {
                     "resourceType": "MedicationRequest",
-                    "id": f"{pid}-med-{rng.randint(0, 999999)}",
+                    "id": f"med-{_opaque_id(rng)}",
                     "subject": {"reference": f"Patient/{pid}"},
                     "medicationCodeableConcept": {"coding": [{"system": system, "code": code, "display": display}]},
                     "authoredOn": _random_date(rng, birth, date(2025, 12, 31)).isoformat(),
