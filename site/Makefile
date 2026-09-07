@@ -10,7 +10,7 @@ setup:
 	uv run data-counts setup-models
 
 gen-data:
-	uv run data-counts stage1-synthea --out data/synthea_ndjson
+	uv run data-counts stage1-synthea --population 1000000 --out data/synthea_ndjson
 
 demo:
 	uv run data-counts run-all --dsr $(DSR)

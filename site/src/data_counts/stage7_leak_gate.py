@@ -32,6 +32,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+# Silences a benign transformers/tokenizers warning that fires on every GLiNER call:
+# gliner's own processor.py (data_processing/processor.py) calls the tokenizer with
+# truncation=True but no max_length, and the DeBERTa-v3-small tokenizer it uses has no
+# model_max_length set -- so transformers logs "Asking to truncate... Default to no
+# truncation" once per invocation. Harmless (our inputs are short; nothing is actually
+# truncated either way) and entirely internal to gliner's tokenization pipeline, not
+# something we call directly -- verbosity is the right lever, not a warnings filter,
+# since this is a transformers logger message, not a Python warnings.warn().
+import transformers  # noqa: E402
+transformers.logging.set_verbosity_error()
+
 GLINER_MODEL_ID = "urchade/gliner_small-v2.1"
 GLINER_LABELS = ["person", "phone number", "email", "address", "date of birth", "social security number", "medical record number"]
 GLINER_ONNX_DIR = Path("models/gliner_onnx")

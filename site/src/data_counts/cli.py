@@ -165,22 +165,33 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
                       action="run-all", resource="site-cli", outcome="success")
     request_id = "unknown"
     try:
-        rprint("[bold cyan]Stage 1: Synthea generation[/bold cyan]")
+        rprint("[bold cyan]Stage 1/9 — Synthea generation[/bold cyan] [dim](Req 1a)[/dim]")
         s1 = stage1_synthea.run(population=population)
         audit_log.record(stage_id="stage1_synthea", batch_id="cohort", record_counts=s1["counts"],
                           outcome="ok", reconciliation_status="n/a")
+        total_resources = sum(s1["counts"].values())
+        rprint(f"  [dim]source:[/dim] {s1['source']}")
+        for resource_type, count in s1["counts"].items():
+            rprint(f"  [dim]•[/dim] {resource_type}: {count}")
+        rprint(f"  [green]✓[/green] {s1['counts'].get('Patient', 0)} patients, {total_resources} resources total")
 
-        rprint("[bold cyan]Stage 2: Ingest (raw lossless landing + analytic views)[/bold cyan]")
+        rprint("[bold cyan]Stage 2/9 — Ingest: raw lossless landing + analytic views[/bold cyan] [dim](Req 1a, 6)[/dim]")
         s2 = stage2_ingest.run(s1["out_dir"])
         audit_log.record(stage_id="stage2_ingest", batch_id="lake", record_counts=s2["raw"],
                           outcome="ok", reconciliation_status="ok")
+        rprint(f"  [green]✓[/green] {sum(s2['raw'].values())} records landed as nested Parquet (data/lake/raw/)")
+        rprint(f"  [green]✓[/green] {sum(s2['views'].values())} rows projected into flat analytic views (data/lake/views/)")
 
-        rprint("[bold cyan]Stage 3: DSR orchestration[/bold cyan]")
+        rprint("[bold cyan]Stage 3/9 — DSR orchestration[/bold cyan] [dim](Req 2)[/dim]")
         s3 = stage3_dsr.run(dsr)
         request_id = s3["dsr"].request_id
         availability = s3["availability"]
+        rprint(f"  [dim]request_id:[/dim] {s3['dsr'].request_id}  [dim]version:[/dim] {s3['dsr'].version}  "
+               f"[dim]cadence:[/dim] {s3['dsr'].refresh_cadence}")
         if availability["missing_domains"] or availability["missing_fields"]:
-            rprint(f"[yellow]DSR availability gaps (no silent substitution): {availability}[/yellow]")
+            rprint(f"  [yellow]⚠ availability gaps (no silent substitution): {availability}[/yellow]")
+        else:
+            rprint("  [green]✓[/green] every requested domain/field is present — nothing silently substituted")
         audit_log.record(stage_id="stage3_dsr", batch_id=s3["dsr"].request_id, record_counts={},
                           outcome="ok", reconciliation_status="ok", extra=availability)
         seclog.log_event(
@@ -190,8 +201,11 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
                     f"permission_version={s3['dsr'].authorization.permission_version}",
         )
 
-        rprint("[bold cyan]Stage 4: Data quality (Kahn framework)[/bold cyan]")
+        rprint("[bold cyan]Stage 4/9 — Data quality (Kahn framework)[/bold cyan] [dim](Req 3)[/dim]")
         s4 = stage4_dq_kahn.run(s3["dsr"].checks)
+        for check in s4["checks"]:
+            mark = "[red]✗[/red]" if check["anomaly"] else "[green]✓[/green]"
+            rprint(f"  {mark} {check['id']} ({check['kahn_category']}/{check['type']}, on_fail={check['on_fail']})")
         audit_log.record(
             stage_id="stage4_dq_kahn", batch_id=s3["dsr"].request_id,
             record_counts={c["id"]: int(not c["anomaly"]) for c in s4["checks"]},
@@ -206,12 +220,14 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
                               message="on_fail=halt check failed; transmission blocked")
             raise PipelineHalt(f"DQ check(s) failed with on_fail=halt: {s4}")
 
-        rprint("[bold cyan]Stage 5: De-identification[/bold cyan]")
+        rprint("[bold cyan]Stage 5/9 — De-identification[/bold cyan] [dim](Req 4)[/dim]")
         s5 = stage5_deid.run(s3["dsr"])
         audit_log.record(stage_id="stage5_deid", batch_id=s3["dsr"].request_id, record_counts=s5,
                           outcome="ok", reconciliation_status="ok")
+        rprint(f"  [green]✓[/green] 18 HIPAA identifiers removed; per-patient date-shift applied across {len(s5)} domains "
+               f"({sum(s5.values())} rows)")
 
-        rprint("[bold cyan]Stage 6: OPPRL tokenization (site side: tokenize + transcrypt_out only)[/bold cyan]")
+        rprint("[bold cyan]Stage 6/9 — OPPRL tokenization[/bold cyan] [dim](Req 5, site half only — tokenize + transcrypt_out)[/dim]")
         tokens = stage6_pprl.run()
         audit_log.record(
             stage_id="stage6_pprl", batch_id=s3["dsr"].request_id, record_counts={"patients_tokenized": len(tokens)},
@@ -222,14 +238,17 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
             action="generate_site_keys", resource="data/work/pprl/site", outcome="success",
             message="fresh RSA keypair generated for this run",
         )
+        rprint(f"  [green]✓[/green] {len(tokens)} patients tokenized (token1/2/3), encrypted under the central platform's public key")
+        rprint("  [dim]→ this site cannot decrypt what it just produced — only the central platform's private key can[/dim]")
 
-        rprint("[bold cyan]Stage 7: Residual PII-leakage gate[/bold cyan]")
+        rprint("[bold cyan]Stage 7/9 — Residual PII-leakage gate[/bold cyan] [dim](Req 3 halt-on-anomaly, 9, 13)[/dim]")
         # This synthetic cohort carries no free-text clinical notes, so the real outbound
         # batch is scanned here (and is expected to come back clean). The halt path itself
         # is demonstrated separately, on a deliberately injected-PII fixture, so that
         # demonstrating the halt doesn't block this run from reaching stage 8/outbox --
         # both are acceptance criteria, and conflating them would make one impossible to show.
         real_notes: list[dict] = []
+        rprint("  [dim]scanning the real outbound batch (0 free-text notes in this cohort — expected clean)...[/dim]")
         s7 = stage7_leak_gate.run(real_notes, batch_id=s3["dsr"].request_id)
         audit_log.record(
             stage_id="stage7_leak_gate", batch_id=s3["dsr"].request_id,
@@ -242,8 +261,9 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
                               action="stage7_leak_gate", resource=s3["dsr"].request_id, outcome="halted",
                               message=f"routed to {s7.get('review_path')}")
             raise PipelineHalt("Unresolved residual PII leak")
+        rprint("  [green]✓[/green] real outbound batch: clean, 0 detectors fired")
 
-        rprint("[bold cyan]Stage 7 (demo): injected-PII leak halts and routes to review_queue/[/bold cyan]")
+        rprint("  [dim]scanning a deliberately injected-PII fixture (Presidio + Philter + GLiNER, recall-tuned)...[/dim]")
         injected_leak_notes = [{"id": "note-injected-leak", "note_text": "Patient Jane Q. Doe, DOB 1980-05-12, SSN 123-45-6789, reachable at jane.doe@example.com."}]
         s7_demo = stage7_leak_gate.run(injected_leak_notes, batch_id=f"{s3['dsr'].request_id}-leak-demo")
         audit_log.record(
@@ -252,23 +272,35 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
             outcome="halt" if s7_demo["halt"] else "ok", reconciliation_status="scanned",
         )
         if s7_demo["halt"]:
-            rprint(f"[green]Injected-leak demo halted as expected -- routed to {s7_demo.get('review_path')}.[/green]")
+            hit_count = sum(len(f["hits"]) for f in s7_demo["flagged"])
+            detectors = sorted({h["detector"] for f in s7_demo["flagged"] for h in f["hits"]})
+            rprint(f"  [green]✓[/green] injected leak caught: {hit_count} spans across {len(detectors)} independent detectors "
+                    f"({', '.join(detectors)})")
+            rprint(f"  [green]✓[/green] halted as expected -- routed to {s7_demo.get('review_path')}")
         else:
-            rprint("[yellow]Injected-leak demo did not trigger a halt -- detectors may be unavailable (run `make setup`).[/yellow]")
+            rprint("  [yellow]⚠ injected-leak demo did not trigger a halt -- detectors may be unavailable (run `make setup`).[/yellow]")
 
-        rprint("[bold cyan]Stage 8: Package + transmit[/bold cyan]")
+        rprint("[bold cyan]Stage 8/9 — Package + transmit[/bold cyan] [dim](Req 8, 15)[/dim]")
         s8 = stage8_package.run("data/work/deid", tokens, s3["dsr"].request_id)
         audit_log.record(stage_id="stage8_package", batch_id=s8["snapshot_id"], record_counts=s8["tables"],
                           outcome="ok", reconciliation_status="ok")
+        rprint(f"  [dim]snapshot:[/dim] {s8['snapshot_id']}  [dim]refresh:[/dim] {s8['refresh_id']}")
+        for table_name, info in s8["tables"].items():
+            rprint(f"  [dim]•[/dim] {table_name}: {info['row_count']} rows")
+        rprint(f"  [green]✓[/green] +{len(s8['diff']['added'])} added / {len(s8['diff']['updated'])} updated / "
+               f"{len(s8['diff']['deleted'])} deleted since last refresh")
 
-        rprint("[bold cyan]Stage 9: Audit + QA manifest + RFI summary[/bold cyan]")
+        rprint("[bold cyan]Stage 9/9 — Audit + QA manifest + RFI summary[/bold cyan] [dim](Req 1b, 9, 11)[/dim]")
         record_counts = {**s1["counts"], **s2["raw"]}
         qa_manifest = stage9_audit.build_qa_manifest(record_counts, s4, s7)
         stage9_audit.write_qa_manifest(qa_manifest)
         stage9_audit.write_rfi_summary(s3["dsr"].request_id, s3["dsr"].version, halted=False)
         stage9_audit.log_model_versions(audit_log, s3["dsr"].version)
+        rprint("  [green]✓[/green] audit trail, PII-free QA manifest, and RFI summary written to data/work/")
+        rprint("  [dim]→ run `data-counts verify-logs` to confirm neither log has been tampered with[/dim]")
 
-        rprint("[bold green]run-all complete.[/bold green]")
+        rprint(f"\n[bold green]✓ run-all complete[/bold green] — request {request_id}, "
+               f"{s1['counts'].get('Patient', 0)} patients through all 9 stages, nothing halted.")
         rprint(qa_manifest)
 
     except PipelineHalt as halt:
