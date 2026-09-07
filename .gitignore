@@ -4,6 +4,8 @@ models/
 inbox/
 keys/
 linkage_ground_truth.json
+security_audit.cef.log
+security_audit.cef.log.chainhead
 .venv/
 __pycache__/
 *.pyc

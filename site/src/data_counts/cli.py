@@ -4,6 +4,7 @@ SYNTHETIC DATA ONLY. See README.md for the full RFI-requirement map.
 """
 from __future__ import annotations
 
+import getpass
 import json
 from pathlib import Path
 
@@ -22,6 +23,9 @@ from . import (
     stage9_audit,
 )
 from .audit import AuditLog, PipelineHalt
+from .security_audit import SecurityAuditLog
+
+_operator = getpass.getuser()
 
 app = typer.Typer(help="Data COUNTS leave-behind pipeline POC (synthetic data only).")
 
@@ -35,6 +39,12 @@ def setup_models():
     Presidio's spaCy engine falls back to a `pip`-based auto-download otherwise, and a
     `uv`-managed venv doesn't ship `pip`), so plain `uv sync` already installs it.
     """
+    seclog = SecurityAuditLog()
+    seclog.log_event(category="authentication", name="CLI invocation", user=_operator,
+                      action="setup-models", resource="site-cli", outcome="success")
+    seclog.log_event(category="administrative_action", name="Model provisioning", user=_operator,
+                      action="download+export models", resource="models/", outcome="attempted")
+
     rprint("[bold]Downloading models (GLiNER, nltk data)...[/bold]")
     try:
         result = stage7_leak_gate.export_gliner_onnx()
@@ -126,10 +136,33 @@ def export_linkage_demo_sites(
     rprint(f"[green]Ground truth (demo-only) -> {ground_truth_path}[/green]")
     rprint("Run `cd ../central && uv run data-counts-central link --ground-truth ../linkage_ground_truth.json`.")
 
+    seclog = SecurityAuditLog()
+    seclog.log_event(category="administrative_action", name="Linkage demo export", user=_operator,
+                      action="export-linkage-demo-sites", resource=inbox_dir, outcome="success")
+
+
+@app.command("verify-logs")
+def verify_logs(work_dir: str = "data/work"):
+    """Verify both hash-chained logs (Req 11: "protected against unauthorized
+    modification or deletion"). Detects any edit, deletion, reordering, or
+    truncation of a previously-written entry.
+    """
+    audit_result = AuditLog(work_dir).verify()
+    security_result = SecurityAuditLog(work_dir).verify()
+    rprint(f"[bold cyan]Processing audit log (Req 9):[/bold cyan] {audit_result}")
+    rprint(f"[bold cyan]Security audit log (Req 11):[/bold cyan] {security_result}")
+    if not (audit_result["ok"] and security_result["ok"]):
+        rprint("[bold red]TAMPERING DETECTED[/bold red]")
+        raise typer.Exit(code=1)
+    rprint("[bold green]Both logs verified intact.[/bold green]")
+
 
 @app.command("run-all")
 def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
     audit_log = AuditLog()
+    seclog = SecurityAuditLog()
+    seclog.log_event(category="authentication", name="CLI invocation", user=_operator,
+                      action="run-all", resource="site-cli", outcome="success")
     request_id = "unknown"
     try:
         rprint("[bold cyan]Stage 1: Synthea generation[/bold cyan]")
@@ -150,6 +183,12 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
             rprint(f"[yellow]DSR availability gaps (no silent substitution): {availability}[/yellow]")
         audit_log.record(stage_id="stage3_dsr", batch_id=s3["dsr"].request_id, record_counts={},
                           outcome="ok", reconciliation_status="ok", extra=availability)
+        seclog.log_event(
+            category="configuration_change", name="DSR loaded", user=_operator, action="load DSR",
+            resource=dsr, outcome="success",
+            message=f"request_id={s3['dsr'].request_id} version={s3['dsr'].version} "
+                    f"permission_version={s3['dsr'].authorization.permission_version}",
+        )
 
         rprint("[bold cyan]Stage 4: Data quality (Kahn framework)[/bold cyan]")
         s4 = stage4_dq_kahn.run(s3["dsr"].checks)
@@ -162,6 +201,9 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
         Path("data/work").mkdir(parents=True, exist_ok=True)
         Path("data/work/dq_anomaly_report.json").write_text(json.dumps(s4, indent=2))
         if s4["halt"]:
+            seclog.log_event(category="security_event", name="DQ halt", user=_operator,
+                              action="stage4_dq_kahn", resource=s3["dsr"].request_id, outcome="halted",
+                              message="on_fail=halt check failed; transmission blocked")
             raise PipelineHalt(f"DQ check(s) failed with on_fail=halt: {s4}")
 
         rprint("[bold cyan]Stage 5: De-identification[/bold cyan]")
@@ -174,6 +216,11 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
         audit_log.record(
             stage_id="stage6_pprl", batch_id=s3["dsr"].request_id, record_counts={"patients_tokenized": len(tokens)},
             outcome="ok", reconciliation_status="ok",
+        )
+        seclog.log_event(
+            category="configuration_change", name="Site OPPRL keypair provisioned", user=_operator,
+            action="generate_site_keys", resource="data/work/pprl/site", outcome="success",
+            message="fresh RSA keypair generated for this run",
         )
 
         rprint("[bold cyan]Stage 7: Residual PII-leakage gate[/bold cyan]")
@@ -191,6 +238,9 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
         )
         if s7["halt"]:
             rprint(f"[red]Residual PII leak detected -- routed to {s7.get('review_path')}. Halting transmission.[/red]")
+            seclog.log_event(category="security_event", name="Residual PII leak", user=_operator,
+                              action="stage7_leak_gate", resource=s3["dsr"].request_id, outcome="halted",
+                              message=f"routed to {s7.get('review_path')}")
             raise PipelineHalt("Unresolved residual PII leak")
 
         rprint("[bold cyan]Stage 7 (demo): injected-PII leak halts and routes to review_queue/[/bold cyan]")

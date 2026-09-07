@@ -35,6 +35,7 @@ make setup          # installs both projects' deps; downloads/exports site's mod
                      # generates central's RSA keypair
 make demo           # runs the main pipeline (site/) end to end
 make linkage-demo   # Req 5 evidence: cross-site linkage + precision/recall/F1
+make verify-logs    # Req 11: confirm both projects' hash-chained logs are untampered
 make test           # both projects' test suites
 ```
 

@@ -45,4 +45,6 @@ probabilities per token.
 | `crypto.py` | RSA keypair generation, AES key derivation, `transcrypt_in` (this platform's only crypto operation — decrypt with our private key, re-encrypt under our own AES key) |
 | `ingest.py` | Reads a site's `patient.parquet` export, resolves its ephemeral tokens |
 | `linkage.py` | Splink-based cross-site probabilistic linkage over resolved tokens |
-| `cli.py` | `setup-keys`, `link` |
+| `evaluation.py` | Precision/recall/F1 against a synthetic-demo-only ground truth |
+| `security_audit.py`, `hash_chain.py` | Req 11: hash-chained, CEF-formatted security audit log (`security_audit.cef.log`) — `setup-keys`/`link` invocations, key generation. `make verify-logs` detects tampering. Duplicated from `../site/`'s copy, same rationale as `crypto.py`. |
+| `cli.py` | `setup-keys`, `link`, `verify-logs` |

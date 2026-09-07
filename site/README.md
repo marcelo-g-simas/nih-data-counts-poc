@@ -42,8 +42,8 @@ make test
 | 5 | `stage6_pprl.py` (site half: tokenize + transcrypt_out); see `../central/` for the resolution + linkage half | OPPRL v2 tokenization (token1/2/3), DuckDB-native |
 | 6 | `stage2_ingest.py` (2a/2b), `fhir_views/*.json`, `viewdef.py` | Lossless, round-trippable raw Parquet layer + traceable flat analytic views |
 | 8 | `stage8_package.py` | Versioned package, idempotent reruns, added/updated/deleted tracking |
-| 9 | `audit.py`, `stage9_audit.py` | Audit trail + PII-free, k-anonymized (k=11) QA manifest |
-| 11 | `stage9_audit.py` | Model versions/hashes + DSR version logged |
+| 9 | `audit.py`, `stage9_audit.py` | Processing audit trail (per-stage record counts/outcome/reconciliation) + PII-free, k-anonymized (k=11) QA manifest |
+| 11 | `stage9_audit.py` (model versions), `security_audit.py`, `hash_chain.py` | Model versions/hashes + DSR version logged; hash-chained, CEF-formatted security audit log (auth/admin/config-change/security events) protected against undetected tampering -- `make verify-logs` |
 | 13 | `stage7_leak_gate.py` | Independent residual-PII QA gate (Presidio + Philter + GLiNER); halts on any hit |
 | 15 | `stage8_package.py` | Refresh-cycle diffing across snapshots |
 
@@ -120,6 +120,29 @@ actual packaged output (not assumed), fixed at the root — resource IDs are now
 122-bit random values with no relationship to any patient identifier — and defensively in
 `stage8_package.py`, which now excludes `id`/`__source_resource_id` from every outbound table
 regardless of what a given ID scheme happens to contain.
+
+## Req 9 & 11: tamper-evident, not tamper-proof — said plainly
+
+Both logs (`data/work/audit_log.jsonl` for Req 9's processing trail, `data/work/security_audit.cef.log`
+for Req 11's security events) are hash-chained (`hash_chain.py`): each entry's hash covers its own
+content plus the previous entry's hash, so editing, deleting, reordering, or truncating any entry
+breaks the chain from that point forward. `make verify-logs` recomputes the chain from genesis and
+reports the first break, if any — demonstrated end to end (including two deliberate-tamper tests)
+in `tests/test_tamper_evidence.py`.
+
+This is **tamper-evident**, not what a strict reading of "tamper-proof" would require: a local file
+is not write-once storage, and someone with filesystem access to *both* the log and its small
+`.chainhead` sidecar file could in principle recompute the entire chain to hide an edit. The sidecar
+matters precisely because it raises the bar — an attacker has to get two files consistent, not one —
+but it's not cryptographic proof against a fully capable local attacker. Real write-once guarantees
+would need external anchoring (e.g., forwarding to a WORM-configured SIEM or periodically publishing
+chain heads somewhere the site can't retroactively edit) that a laptop-scale POC doesn't have.
+
+The security log is CEF (Common Event Format) — the format Splunk, Sentinel, QRadar, and ArcSight
+all parse natively — so a Healthcare Partner's existing SIEM can ingest it directly (file-tail
+forwarder, no bespoke connector) rather than this pipeline needing to know which SIEM a given site
+runs. The hash-chain fields ride along as two extra CEF custom extensions (`cs2`/`cs3`); a SIEM that
+doesn't know what they mean just indexes them as ordinary searchable fields.
 
 ## Stage 1: Synthea
 

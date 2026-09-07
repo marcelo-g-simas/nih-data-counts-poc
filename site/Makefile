@@ -1,4 +1,4 @@
-.PHONY: setup gen-data demo test clean lint docker-build docker-run docker-save
+.PHONY: setup gen-data demo verify-logs test clean lint docker-build docker-run docker-save
 
 DSR ?= dsr/examples/DC-POC-0001.json
 IMAGE ?= data-counts-poc:latest
@@ -14,6 +14,9 @@ gen-data:
 
 demo:
 	uv run data-counts run-all --dsr $(DSR)
+
+verify-logs:
+	uv run data-counts verify-logs
 
 test:
 	uv run pytest -q

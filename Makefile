@@ -1,4 +1,4 @@
-.PHONY: setup demo linkage-demo test clean
+.PHONY: setup demo linkage-demo verify-logs test clean
 
 # One-time setup for both projects: installs deps, downloads/exports models
 # (site), and generates the central platform's RSA keypair (central).
@@ -18,6 +18,12 @@ demo:
 linkage-demo:
 	cd site && uv run data-counts export-linkage-demo-sites
 	cd central && uv run data-counts-central link --ground-truth ../linkage_ground_truth.json
+
+# Req 11: verify both projects' hash-chained logs are intact (detects any
+# edit, deletion, reordering, or truncation of a previously-written entry).
+verify-logs:
+	cd site && $(MAKE) verify-logs
+	cd central && $(MAKE) verify-logs
 
 test:
 	cd site && $(MAKE) test

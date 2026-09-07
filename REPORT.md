@@ -54,7 +54,7 @@ Philter, because resolving and linking tokens never requires touching a raw iden
 | 5 | `stage6_pprl.py` + `central/` | OPPRL v2 token1/2/3, cross-site Splink linkage — see §5, the core of this report |
 | 6 | `stage2_ingest.py`, `fhir_views/*.json` | Lossless raw Parquet layer + traceable flat analytic views, round-trip tested |
 | 8, 15 | `stage8_package.py` | Versioned, idempotent package to `outbox/`; refresh-cycle diffing |
-| 11 | `stage9_audit.py` | Pinned model versions/hashes + DSR version logged every run |
+| 11 | `stage9_audit.py`, `security_audit.py`, `hash_chain.py` (both projects) | Pinned model versions/hashes + DSR version logged; hash-chained CEF security audit log, tamper detection demonstrated — see §6 |
 | 13 | `stage7_leak_gate.py` | Independent QA gate (Presidio + Philter + GLiNER); halts and routes to `review_queue/` on any hit |
 
 ## 3. Example: data-quality checks (Req 3)
@@ -182,14 +182,57 @@ incorporating SSN or a health-plan member ID, per the full OPPRL v2 spec's `toke
 which this POC doesn't implement) or a human review step for borderline clusters. Reporting a
 0.667 precision instead of a rigged 1.0 is the point of including this case at all.
 
-## 6. Test coverage
+## 6. Tamper-evident audit logging (Req 11)
+
+The RFI asks for two different things that are easy to conflate: Req 9's *processing* audit trail
+(per-stage record counts/outcome/reconciliation — `audit_log.jsonl`) and Req 11's *security* audit
+log (authentication, administrative actions, configuration changes, and security events, "protected
+against unauthorized modification or deletion"). Both existed only as plain append-mode files until
+this pass — meaning either could be edited or deleted with zero detection. Both are now hash-chained
+(`hash_chain.py`, duplicated in each project the same way the OPPRL crypto is): every entry's hash
+covers its own content plus the previous entry's hash, so any edit, deletion, reordering, or
+truncation breaks the chain from that point forward.
+
+```
+$ make verify-logs
+Processing audit log (Req 9):  {'ok': True, 'records_checked': 10, 'first_break_at': None}
+Security audit log (Req 11):   {'ok': True, 'records_checked': 4,  'first_break_at': None}
+Both logs verified intact.
+```
+
+Demonstrated, not just claimed: `tests/test_tamper_evidence.py` (both projects) edits a live log's
+content in place and asserts `verify()` reports `ok: False` with the exact index of the broken
+entry — the same check `make verify-logs` runs by hand found the deliberately-introduced edit
+below during development of this feature:
+
+```
+$ sed -i '1s/"Condition": 182/"Condition": 5/' data/work/audit_log.jsonl
+$ make verify-logs
+Processing audit log (Req 9): {'ok': False, 'records_checked': 0, 'first_break_at': 0}
+TAMPERING DETECTED
+```
+
+**Said plainly: tamper-evident, not tamper-proof.** A local file is not write-once storage; someone
+with filesystem access to both the log and its small `.chainhead` sidecar file could, in principle,
+recompute the whole chain to hide an edit. The sidecar living outside the log raises the bar — two
+files have to be made consistent, not one — but it isn't cryptographic proof against a fully
+capable local attacker. True write-once guarantees need external anchoring this laptop-scale POC
+doesn't have.
+
+The security log is emitted as CEF (Common Event Format) — natively parsed by Splunk, Microsoft
+Sentinel, IBM QRadar, and ArcSight — so a Healthcare Partner's existing SIEM can tail the file
+directly rather than this pipeline needing a bespoke connector per vendor. The two hash-chain
+fields ride along as ordinary CEF custom extensions (`cs2`/`cs3`); a SIEM that doesn't recognize
+them just indexes them as extra searchable fields.
+
+## 7. Test coverage
 
 | Project | Tests | Result |
 |---|---|---|
-| `site/` | 16 | all pass — DQ checks, PPRL determinism + phonetic tolerance, round-trip, reproducibility, leak-gate routing |
-| `central/` | 7 | all pass — crypto (transcrypt_in correctness/determinism), evaluation (precision/recall/F1 on known confusion-matrix cases), Splink linkage integration |
+| `site/` | 23 | all pass — DQ checks, PPRL determinism + phonetic tolerance, round-trip, reproducibility, leak-gate routing, tamper-evidence |
+| `central/` | 10 | all pass — crypto (transcrypt_in correctness/determinism), evaluation (precision/recall/F1 on known confusion-matrix cases), Splink linkage integration, tamper-evidence |
 
-## 7. What this POC deliberately does not claim
+## 8. What this POC deliberately does not claim
 
 - `token1`/`2`/`3` are 3 of OPPRL v2's 13 defined token variants (the ones using name/gender/DOB);
   SSN- and email-based variants aren't implemented.
@@ -198,3 +241,6 @@ which this POC doesn't implement) or a human review step for borderline clusters
 - The twins false positive in §5.5 is real and expected to recur in production for any two
   people who share a birth date and a phonetically close name, absent a more discriminating token
   or a human review step.
+- The hash-chained logs (§6) are tamper-*evident*, not tamper-*proof*: a local attacker with
+  filesystem access to both the log and its chain-head sidecar could still hide an edit by
+  recomputing the whole chain. Real write-once guarantees need external anchoring this POC doesn't have.

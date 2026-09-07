@@ -1,4 +1,4 @@
-.PHONY: setup link test lint clean
+.PHONY: setup link verify-logs test lint clean
 
 setup:
 	uv sync --all-extras
@@ -8,6 +8,9 @@ setup:
 link:
 	uv run data-counts-central link
 
+verify-logs:
+	uv run data-counts-central verify-logs
+
 test:
 	uv run pytest -q
 
@@ -15,4 +18,4 @@ lint:
 	uv run ruff check src tests
 
 clean:
-	rm -rf inbox/* keys/*
+	rm -rf inbox/* keys/* security_audit.cef.log security_audit.cef.log.chainhead
