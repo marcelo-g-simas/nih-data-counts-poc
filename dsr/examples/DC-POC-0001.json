@@ -1,0 +1,28 @@
+{
+  "request_id": "DC-POC-0001",
+  "version": "1.0.0",
+  "authorization": { "permission_version": "2026-09-01", "irb_ref": "SYNTHETIC" },
+  "cohort": {
+    "inclusion": [{ "domain": "condition", "code_system": "ICD-10", "codes": ["E11%"] }],
+    "exclusion": []
+  },
+  "source_systems": ["emr"],
+  "domains": ["patient", "condition", "observation", "medication", "encounter"],
+  "fields": [
+    { "domain": "observation", "name": "value_quantity", "required": true },
+    { "domain": "observation", "name": "loinc_code", "required": true }
+  ],
+  "date_range": { "start": "2015-01-01", "end": "2025-12-31" },
+  "extraction_mode": "full",
+  "refresh_cadence": "monthly",
+  "deidentification": {
+    "date_shift": { "per_patient": true, "max_days": 365, "preserve_order": true }
+  },
+  "checks": [
+    { "id": "comp_dob", "kahn_category": "completeness", "target": "patient.birth_date", "type": "completeness", "on_fail": "warn" },
+    { "id": "uniq_patient", "kahn_category": "conformance", "target": "patient.id", "type": "uniqueness", "on_fail": "halt" },
+    { "id": "dtype_value", "kahn_category": "conformance", "target": "observation.value_quantity", "type": "data_type", "params": { "dtype": "double" }, "on_fail": "halt" },
+    { "id": "dateseq_enc", "kahn_category": "plausibility", "target": "encounter", "type": "date_sequence", "params": { "start": "period_start", "end": "period_end" }, "on_fail": "halt" },
+    { "id": "rpp_obs", "kahn_category": "plausibility", "target": "observation", "type": "records_per_patient", "params": { "min": 1, "max": 5000 }, "on_fail": "warn" }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "resourceType": "ViewDefinition",
+  "resource": "Observation",
+  "select": [
+    { "column": [
+      { "name": "id", "path": "getResourceKey()" },
+      { "name": "patient_id", "path": "subject.getReferenceKey()" },
+      { "name": "encounter_id", "path": "encounter.getReferenceKey()" },
+      { "name": "effective_dt", "path": "effectiveDateTime" },
+      { "name": "value_quantity", "path": "valueQuantity.value" },
+      { "name": "value_unit", "path": "valueQuantity.unit" }
+    ] },
+    { "forEach": "code.coding", "column": [
+      { "name": "code_system", "path": "system" },
+      { "name": "loinc_code", "path": "code" },
+      { "name": "code_display", "path": "display" }
+    ] }
+  ]
+}

@@ -1,0 +1,9 @@
+data/
+outbox/
+models/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
