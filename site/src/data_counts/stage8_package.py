@@ -40,19 +40,29 @@ def _table_sha256(path: Path) -> str:
 _INTERNAL_ONLY_COLUMNS = ("id", "__source_resource_id")
 
 
-def _apply_tokens(deid_dir: Path, token_map: dict[str, str], out_dir: Path) -> dict[str, int]:
-    """Replace patient_id / id with the OPPRL token; drop all raw internal keys. [Req 4, 5, 13]"""
+def _apply_tokens(deid_dir: Path, token_map: dict[str, dict[str, str]], out_dir: Path) -> dict[str, int]:
+    """Replace patient_id / id with the three ephemeral OPPRL tokens; drop all raw
+    internal keys. [Req 4, 5, 13]
+
+    `token_map` values are `{"token1": ephemeral, "token2": ephemeral, "token3": ephemeral}`
+    -- RSA-encrypted under the central platform's public key (see stage6_pprl.py). Only
+    the central platform, holding the matching private key, can ever resolve these into
+    linkable tokens; this site never sees (and cannot compute) the resolved value.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect()
-    con.register("token_map", pa.Table.from_pylist([{"patient_id": k, "token": v} for k, v in token_map.items()]))
+    con.register("token_map", pa.Table.from_pylist([
+        {"patient_id": pid, **tokens} for pid, tokens in token_map.items()
+    ]))
     counts = {}
     internal_cols = ", ".join(_INTERNAL_ONLY_COLUMNS)
+    token_select = "t.token1 AS subject_token1, t.token2 AS subject_token2, t.token3 AS subject_token3"
 
     patient_src = deid_dir / "patient.parquet"
     if patient_src.exists():
         out_path = out_dir / "patient.parquet"
         con.execute(
-            f"COPY (SELECT t.token AS subject_token, p.* EXCLUDE ({internal_cols}) "
+            f"COPY (SELECT {token_select}, p.* EXCLUDE ({internal_cols}) "
             f"FROM read_parquet('{patient_src.as_posix()}') p "
             f"JOIN token_map t ON p.id = t.patient_id) TO '{out_path.as_posix()}' (FORMAT parquet)"
         )
@@ -64,7 +74,7 @@ def _apply_tokens(deid_dir: Path, token_map: dict[str, str], out_dir: Path) -> d
             continue
         out_path = out_dir / f"{domain}.parquet"
         con.execute(
-            f"COPY (SELECT t.token AS subject_token, d.* EXCLUDE (patient_id, {internal_cols}) "
+            f"COPY (SELECT {token_select}, d.* EXCLUDE (patient_id, {internal_cols}) "
             f"FROM read_parquet('{src.as_posix()}') d JOIN token_map t ON d.patient_id = t.patient_id) "
             f"TO '{out_path.as_posix()}' (FORMAT parquet)"
         )
@@ -90,7 +100,7 @@ def _diff_against_previous(request_dir: Path, current_tokens: set[str]) -> dict:
     return diff
 
 
-def run(deid_dir: str | Path, token_map: dict[str, str], request_id: str,
+def run(deid_dir: str | Path, token_map: dict[str, dict[str, str]], request_id: str,
         outbox_dir: str | Path = "outbox") -> dict:
     """Idempotent by content: an identical rerun (same DSR + unchanged source)
     reproduces the same snapshot_id and returns the existing manifest rather
@@ -118,7 +128,10 @@ def run(deid_dir: str | Path, token_map: dict[str, str], request_id: str,
 
     refresh_manifests = sorted(request_dir.glob("*/manifest.json"))
     refresh_id = f"r{len(refresh_manifests) + 1}"
-    diff = _diff_against_previous(request_dir, set(token_map.values()))
+    # token1's ephemeral value is the per-record identity key for refresh diffing --
+    # site-local and deterministic per patient, though only the central platform (with
+    # its private key) can ever resolve what it actually links to.
+    diff = _diff_against_previous(request_dir, {tokens["token1"] for tokens in token_map.values()})
 
     manifest = {
         "schema_version": SCHEMA_VERSION,

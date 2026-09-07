@@ -62,6 +62,71 @@ def cli_stage2(ndjson_dir: str = "data/synthea_ndjson", lake_dir: str = "data/la
     rprint(result)
 
 
+@app.command("export-linkage-demo-sites")
+def export_linkage_demo_sites(
+    central_public_key_path: str = "../central/keys/central_public_key.pem",
+    inbox_dir: str = "../central/inbox",
+    ground_truth_path: str = "../linkage_ground_truth.json",
+):
+    """Simulate two independently-keyed Healthcare Partner sites and export both
+    to the central platform's inbox, to demonstrate noisy-identifier linkage
+    (Req 5). Five scenarios, chosen to give recall/precision/F1 something real
+    to measure rather than a trivial 100%/100%:
+
+      - exact:  identical spelling at both sites -- the baseline case.
+      - noisy:  a last-name typo ("Smith"/"Smyth") -- breaks token1's exact
+                match, but token2/token3 (soundex/metaphone) still agree, so
+                this should still link. Tests recall under noise.
+      - site_a_only / site_b_only: unique to one site -- should never link.
+      - twins:  two genuinely different people (matching DOB and gender, as
+                real twins would) whose first names are phonetically close
+                ("Jordan"/"Jorden") and who share a last name and first
+                initial -- so *every* token agrees despite them being
+                different individuals. A known, honest limitation of any
+                token scheme this coarse: it cannot out-of-the-box distinguish
+                twins. Tests precision -- expect a false positive here.
+
+    Also writes `ground_truth_path`, a synthetic-demo-only answer key (which
+    patient is which real identity) used purely to score the linkage results
+    afterward -- central never sees this file; it plays no role in the actual
+    privacy-preserving pipeline.
+    """
+    exact = {"first_name": "Jane", "last_name": "Doe", "gender": "F", "birth_date": "1980-05-12"}
+    site_a_only = {"first_name": "Alice", "last_name": "Anders", "gender": "F", "birth_date": "1990-01-01"}
+    site_b_only = {"first_name": "Bob", "last_name": "Baker", "gender": "M", "birth_date": "1985-06-15"}
+    noisy_a = {"first_name": "John", "last_name": "Smith", "gender": "M", "birth_date": "1975-11-03"}
+    noisy_b = {"first_name": "John", "last_name": "Smyth", "gender": "M", "birth_date": "1975-11-03"}
+    twin_a = {"first_name": "Jordan", "last_name": "Doe", "gender": "M", "birth_date": "2001-03-15"}
+    twin_b = {"first_name": "Jorden", "last_name": "Doe", "gender": "M", "birth_date": "2001-03-15"}
+
+    # (local_patient_id, patient dict, true-identity label) -- the label is what the
+    # ground-truth file records; two rows sharing a label are truly the same person.
+    site_a_rows = [("a-0", exact, "jane"), ("a-1", noisy_a, "john_smith"),
+                   ("a-2", site_a_only, "alice"), ("a-3", twin_a, "twin_a")]
+    site_b_rows = [("b-0", exact, "jane"), ("b-1", noisy_b, "john_smith"),
+                   ("b-2", site_b_only, "bob"), ("b-3", twin_b, "twin_b")]
+
+    def roster(rows: list[tuple[str, dict, str]]) -> list[dict]:
+        return [{**patient, "patient_id": pid} for pid, patient, _label in rows]
+
+    path_a = stage6_pprl.export_site_roster(roster(site_a_rows), f"{inbox_dir}/site_a", central_public_key_path)
+    path_b = stage6_pprl.export_site_roster(roster(site_b_rows), f"{inbox_dir}/site_b", central_public_key_path)
+
+    # Two rows are a true match iff their labels are equal -- note twin_a/twin_b are
+    # deliberately DIFFERENT labels (they're different real people), even though every
+    # token will treat them as matching. No other bookkeeping needed for that case.
+    ground_truth = {
+        "site_a": {pid: label for pid, _p, label in site_a_rows},
+        "site_b": {pid: label for pid, _p, label in site_b_rows},
+    }
+    Path(ground_truth_path).write_text(json.dumps(ground_truth, indent=2))
+
+    rprint(f"[green]Exported site_a ({len(site_a_rows)} patients) -> {path_a}[/green]")
+    rprint(f"[green]Exported site_b ({len(site_b_rows)} patients) -> {path_b}[/green]")
+    rprint(f"[green]Ground truth (demo-only) -> {ground_truth_path}[/green]")
+    rprint("Run `cd ../central && uv run data-counts-central link --ground-truth ../linkage_ground_truth.json`.")
+
+
 @app.command("run-all")
 def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
     audit_log = AuditLog()
@@ -104,13 +169,11 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
         audit_log.record(stage_id="stage5_deid", batch_id=s3["dsr"].request_id, record_counts=s5,
                           outcome="ok", reconciliation_status="ok")
 
-        rprint("[bold cyan]Stage 6: OPPRL tokenization[/bold cyan]")
+        rprint("[bold cyan]Stage 6: OPPRL tokenization (site side: tokenize + transcrypt_out only)[/bold cyan]")
         tokens = stage6_pprl.run()
-        both_ends = stage6_pprl.demo_both_ends()
         audit_log.record(
-            stage_id="stage6_pprl", batch_id=s3["dsr"].request_id, record_counts={"tokens": len(tokens)},
+            stage_id="stage6_pprl", batch_id=s3["dsr"].request_id, record_counts={"patients_tokenized": len(tokens)},
             outcome="ok", reconciliation_status="ok",
-            extra={"both_ends_linkage_ok": both_ends["shared_identities_linked"] and both_ends["non_overlapping_do_not_link"]},
         )
 
         rprint("[bold cyan]Stage 7: Residual PII-leakage gate[/bold cyan]")

@@ -408,7 +408,7 @@ wheels = [
 ]
 
 [[package]]
-name = "data-counts-poc"
+name = "data-counts-site"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -419,6 +419,7 @@ dependencies = [
     { name = "en-core-web-sm" },
     { name = "faker" },
     { name = "gliner" },
+    { name = "jellyfish" },
     { name = "numpy" },
     { name = "onnx" },
     { name = "onnxruntime" },
@@ -451,6 +452,7 @@ requires-dist = [
     { name = "en-core-web-sm", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl" },
     { name = "faker", specifier = "==25.9.2" },
     { name = "gliner", specifier = "==0.2.28" },
+    { name = "jellyfish", specifier = "==1.2.1" },
     { name = "numpy", specifier = "==1.26.4" },
     { name = "onnx", specifier = "==1.17.0" },
     { name = "onnxruntime", specifier = "==1.19.2" },

@@ -1,6 +1,9 @@
 data/
 outbox/
 models/
+inbox/
+keys/
+linkage_ground_truth.json
 .venv/
 __pycache__/
 *.pyc
