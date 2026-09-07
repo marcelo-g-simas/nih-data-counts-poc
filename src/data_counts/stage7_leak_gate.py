@@ -3,10 +3,27 @@
 Independently scans the de-identified + tokenized output with three
 detectors that are deliberately *not* the de-id engine (stage 5) or the PPRL
 identity attributes (stage 6): Presidio (spaCy-backed NER + regex
-recognizers), GLiNER (an ONNX/INT8 zero-shot NER checkpoint, CPU-only), and
-Philter (fully offline regex/POS-based clinical text de-identifier). Tuned
-for recall over precision: ANY hit from ANY detector halts transmission of
-that batch and routes it to data/review_queue/.
+recognizers), GLiNER (a zero-shot NER checkpoint served via ONNX Runtime,
+CPU-only), and Philter (fully offline regex/POS-based clinical text
+de-identifier). Tuned for recall over precision: ANY hit from ANY detector
+halts transmission of that batch and routes it to data/review_queue/.
+
+GLiNER / ONNX Runtime note: `gliner`'s own ONNX support (`export_to_onnx()` /
+`from_pretrained(..., load_onnx_model=True)`, added in gliner>=0.2.24) still
+imports PyTorch unconditionally at the package level -- verified directly
+against the installed source (model.py, onnx/model.py, and decoding/decoder.py
+all `import torch` for tokenization/collation/decoding glue), so this does
+not shrink the dependency footprint. What it *does* give is a real inference
+speedup: the fp32 ONNX export matched the PyTorch model's predictions exactly
+(bit-for-bit scores) on our test text while running the encoder forward pass
+through ONNX Runtime instead of PyTorch eager mode, ~1.7x faster. We use that
+fp32 export, not the INT8-quantized one `export_to_onnx(quantize=True)` also
+produces -- the quantized model measurably regressed recall in our own
+comparison (it missed a date-of-birth entity the fp32/PyTorch models both
+caught, and shifted other entity boundaries), which is a bad trade for a
+detector whose whole design brief is recall over precision. The one-time
+export itself still needs PyTorch (see `export_gliner_onnx()`); that's a
+`setup-models` step, not a run-time one.
 
 Encoder NER only -- no vLLM or any generative-LLM serving stack anywhere.
 """
@@ -17,6 +34,8 @@ from pathlib import Path
 
 GLINER_MODEL_ID = "urchade/gliner_small-v2.1"
 GLINER_LABELS = ["person", "phone number", "email", "address", "date of birth", "social security number", "medical record number"]
+GLINER_ONNX_DIR = Path("models/gliner_onnx")
+GLINER_ONNX_FILE = "model.onnx"  # fp32; see module docstring for why not the INT8 export
 # Presidio's own default nlp engine config wants en_core_web_lg (large, slow to fetch);
 # pin it to the small model instead. It's a real pinned dependency in pyproject.toml
 # (see the `[tool.uv.sources]` comment there for why), so plain `uv sync` installs it.
@@ -41,12 +60,31 @@ def _get_presidio():
     return _presidio_analyzer
 
 
+def export_gliner_onnx(save_dir: str | Path = GLINER_ONNX_DIR) -> dict:
+    """One-time, online export step (part of `setup-models`): download the PyTorch
+    checkpoint and export it to ONNX (fp32 + an INT8 side-export for reference/
+    comparison; the fp32 file is what the pipeline actually loads -- see module
+    docstring for why). After this, `_get_gliner()` never needs PyTorch again.
+    """
+    from gliner import GLiNER
+    model = GLiNER.from_pretrained(GLINER_MODEL_ID)
+    return model.export_to_onnx(save_dir=str(save_dir), onnx_filename=GLINER_ONNX_FILE, quantize=True)
+
+
 def _get_gliner():
     global _gliner_model
     if _gliner_model is None:
         from gliner import GLiNER
-        # Force CPU: no GPU anywhere in this pipeline, per the hard constraints.
-        _gliner_model = GLiNER.from_pretrained(GLINER_MODEL_ID).to("cpu")
+        onnx_path = GLINER_ONNX_DIR / GLINER_ONNX_FILE
+        if onnx_path.exists():
+            # ONNX Runtime backend, CPU-only (ORT has no GPU execution provider configured).
+            _gliner_model = GLiNER.from_pretrained(
+                str(GLINER_ONNX_DIR), load_onnx_model=True, onnx_model_file=GLINER_ONNX_FILE
+            )
+        else:
+            # Fallback for dev/test use before `setup-models` has run. Force CPU either way --
+            # no GPU anywhere in this pipeline, per the hard constraints.
+            _gliner_model = GLiNER.from_pretrained(GLINER_MODEL_ID).to("cpu")
     return _gliner_model
 
 

@@ -37,11 +37,10 @@ def setup_models():
     """
     rprint("[bold]Downloading models (GLiNER, nltk data)...[/bold]")
     try:
-        from gliner import GLiNER
-        GLiNER.from_pretrained(stage7_leak_gate.GLINER_MODEL_ID)
-        rprint("  GLiNER OK")
+        result = stage7_leak_gate.export_gliner_onnx()
+        rprint(f"  GLiNER OK (exported to ONNX: {result['onnx_path']})")
     except Exception as exc:  # noqa: BLE001 -- best-effort setup step, reported not swallowed
-        rprint(f"  [yellow]GLiNER download failed: {exc}[/yellow]")
+        rprint(f"  [yellow]GLiNER download/export failed: {exc}[/yellow]")
     try:
         import nltk
         for resource in ("averaged_perceptron_tagger_eng", "averaged_perceptron_tagger"):

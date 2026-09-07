@@ -85,8 +85,24 @@ possibly-stale training data (as the spec itself warns to do):
   downstream querying is still pure DuckDB SQL. Swapping in real FlatQuack later only requires
   replacing `evaluate_view()`; the ViewDefinition JSON files are unchanged.
 
-Everything else (`cumulus-fhir-support`, `aehrc/parquet-on-fhir` conformance, Presidio, Philter,
-GLiNER ONNX/INT8 CPU checkpoints) matched the spec as written.
+Everything else (`cumulus-fhir-support`, `aehrc/parquet-on-fhir` conformance, Presidio, Philter)
+matched the spec as written. GLiNER didn't quite — see below.
+
+## Stage 7: GLiNER via ONNX Runtime
+
+`gliner`'s own ONNX support (`export_to_onnx()` / `from_pretrained(..., load_onnx_model=True)`)
+does **not** drop PyTorch from the install: verified directly against the installed source, its
+`model.py`, `onnx/model.py`, and `decoding/decoder.py` all `import torch` unconditionally for
+tokenization/collation/decoding glue, even when the encoder forward pass itself runs through ONNX
+Runtime. Torch stays a dependency either way (used for the one-time export in `setup-models`); what
+ONNX buys here is real inference speed (~1.7x faster on our test text, matching PyTorch's output
+bit-for-bit) at the same accuracy, not a smaller footprint.
+
+We export the **fp32** ONNX model, not the INT8-quantized one `export_to_onnx(quantize=True)` also
+produces. In our own side-by-side comparison the quantized model missed a date-of-birth entity that
+both the PyTorch and fp32-ONNX models caught, and shifted other entity boundaries — a bad trade for
+a detector whose whole design brief is recall over precision. `make setup` exports both; only the
+fp32 one is loaded by default (`stage7_leak_gate.GLINER_ONNX_FILE`).
 
 ## Stage 1: Synthea
 
