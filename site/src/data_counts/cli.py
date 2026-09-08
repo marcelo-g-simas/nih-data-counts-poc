@@ -234,9 +234,9 @@ def run_all(drs: str = "drs/examples/DC-POC-0001.json", population: int = 1000):
             outcome="ok", reconciliation_status="ok",
         )
         seclog.log_event(
-            category="configuration_change", name="Site OPPRL keypair provisioned", user=_operator,
+            category="configuration_change", name="Site OPPRL keypair in use", user=_operator,
             action="generate_site_keys", resource="data/work/pprl/site", outcome="success",
-            message="fresh RSA keypair generated for this run",
+            message="site RSA keypair loaded (generated on first run; persists across runs so tokens stay stable)",
         )
         rprint(f"  [green]✓[/green] {len(tokens)} patients tokenized (token1/2/3), encrypted under the central platform's public key")
         rprint("  [dim]→ this site cannot decrypt what it just produced — only the central platform's private key can[/dim]")

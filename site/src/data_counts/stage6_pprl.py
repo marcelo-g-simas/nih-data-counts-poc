@@ -212,6 +212,25 @@ def tokenize_token3(first_name: str | None, last_name: str | None, gender: str |
 _TOKENIZERS = {"token1": tokenize_token1, "token2": tokenize_token2, "token3": tokenize_token3}
 
 
+def stable_diff_key(token: str | None) -> str | None:
+    """A site-local, deterministic identity key for a *site-local* token.
+
+    Exists because `transcrypt_out` is deliberately non-deterministic (see its
+    docstring): the ephemeral token cannot serve as a stable per-record key
+    across refreshes, so anything that needs to recognize "this is the same
+    patient as last run" must key off the pre-transcrypt token instead.
+
+    This value never leaves the site -- it is not transmitted, not packaged, and
+    not resolvable by the central platform. It is a SHA-256 over an already
+    irreversible token, so it discloses nothing the token itself doesn't; it is
+    hashed rather than used raw only so that site-local refresh state (which
+    lives on disk in cleartext) never holds the AES-encrypted token verbatim.
+    """
+    if token is None:
+        return None
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 def transcrypt_out(token: str | None, aes_key: bytes, recipient_public_key_pem: bytes) -> str | None:
     """Decrypt the site-local AES token, re-encrypt under the recipient's RSA public key.
 
@@ -219,6 +238,19 @@ def transcrypt_out(token: str | None, aes_key: bytes, recipient_public_key_pem: 
     ciphertext (encrypted under the central platform's own public key) ever
     leaves the site. Decrypting it back down (`transcrypt_in`) requires the
     central platform's private key, which this project never holds.
+
+    NOTE -- the return value is deliberately NOT deterministic. RSA-OAEP mixes a
+    fresh random seed into every encryption (EME-OAEP encoding), so the same
+    token re-encrypted under the same public key yields different ciphertext
+    each call. That is required for RSA to be semantically secure -- a
+    deterministic RSA envelope would let anyone holding the public key confirm a
+    guessed plaintext by encrypting it themselves -- and it matches upstream
+    spindle-token (`_crypto.py`'s `encrypt_rsa`, `opprl/v0.py::_transcrypt_out_impl`).
+    Determinism lives one layer down, in the AES-GCM-SIV token that `_tokenize`
+    produces; that is the layer OPPRL's linkage property depends on, and the
+    central platform restores determinism in `transcrypt_in` by re-encrypting
+    under its own AES key. Callers needing a stable per-record key must use
+    `stable_diff_key` on the *site-local* token, never this function's output.
     """
     if token is None:
         return None
@@ -231,13 +263,37 @@ def transcrypt_out(token: str | None, aes_key: bytes, recipient_public_key_pem: 
     return base64.b64encode(ciphertext).decode("ascii")
 
 
-def generate_site_keys(site_dir: str | Path) -> tuple[bytes, bytes]:
-    """Generate (and persist) a site-local RSA keypair. [Req 5]"""
+def generate_site_keys(site_dir: str | Path, *, force: bool = False) -> tuple[bytes, bytes]:
+    """Load the site-local RSA keypair, generating it only if absent. [Req 5]
+
+    The site key is *long-lived state*, not per-run state. Because
+    `derive_aes_key_v2` derives the token-encrypting AES key from this key's DER
+    encoding, regenerating it silently changes every OPPRL token this site has
+    ever produced -- so a site that regenerated per run would report its entire
+    cohort as simultaneously added and deleted on every refresh (Req 8's change
+    classes), and could never satisfy Req 5's "consistent tokens across
+    independent site deployments" across time. Load-or-create is what makes the
+    determinism the tokens already have observable across process boundaries.
+
+    `force=True` provisions a fresh keypair, overwriting any existing one. That
+    is a deliberate, destructive re-key: every previously transmitted token
+    becomes unlinkable to anything this site produces afterward. It exists for
+    tests that need an isolated key and for a genuine operator-driven re-key.
+    """
     site_dir = Path(site_dir)
     site_dir.mkdir(parents=True, exist_ok=True)
+    priv_path, pub_path = site_dir / "private_key.pem", site_dir / "public_key.pem"
+
+    if not force and priv_path.exists() and pub_path.exists():
+        return priv_path.read_bytes(), pub_path.read_bytes()
+
     priv, pub = generate_pem_keys()
-    (site_dir / "private_key.pem").write_bytes(priv)
-    (site_dir / "public_key.pem").write_bytes(pub)
+    priv_path.write_bytes(priv)
+    pub_path.write_bytes(pub)
+    # 0600: the site private key is the root of the token namespace. Anyone who
+    # reads it can re-derive the AES key and thus recompute any token this site
+    # emits, which is the whole irreversibility property Req 5 rests on.
+    priv_path.chmod(0o600)
     return priv, pub
 
 
@@ -270,29 +326,43 @@ def register_udfs(con: duckdb.DuckDBPyConnection, private_key_pem: bytes,
         lambda t: transcrypt_out(t, aes_key, recipient_public_key_pem),
         ["VARCHAR"], "VARCHAR",
     )
+    con.create_function("pprl_stable_diff_key", stable_diff_key, ["VARCHAR"], "VARCHAR")
 
 
 def tokenize_and_transcrypt(patients: list[dict], site_priv: bytes, central_pub: bytes) -> dict[str, dict[str, str]]:
     """Tokenize a site's patient roster (dicts with first_name/last_name/gender/birth_date/patient_id)
     into all three token variants, then transcrypt_out each under the central platform's public key.
 
-    Returns {patient_id: {"token1": ephemeral, "token2": ephemeral, "token3": ephemeral}}.
-    The raw `patient_id` here is this function's own internal join key for
-    building the return dict -- it is never itself transmitted anywhere; see
-    stage8_package.py for how the outbound package drops it.
+    Returns {patient_id: {"token1": ephemeral, "token2": ephemeral, "token3": ephemeral,
+    "_diff_key": stable}}. The raw `patient_id` here is this function's own
+    internal join key for building the return dict -- it is never itself
+    transmitted anywhere; see stage8_package.py for how the outbound package
+    drops it, along with the underscore-prefixed site-local `_diff_key`.
     """
     con = duckdb.connect()
     register_udfs(con, site_priv, central_pub)
     con.register("patients", pa.Table.from_pylist(patients))
+    # token1 is computed once and used twice -- transcrypted for transmission and
+    # hashed for the site-local refresh key -- via a CTE rather than two calls,
+    # since a second pprl_tokenize_token1 call would be wasted work.
     rows = con.execute(
+        "WITH t AS (SELECT patient_id, "
+        "  pprl_tokenize_token1(first_name, last_name, gender, birth_date) AS local1, "
+        "  pprl_tokenize_token2(first_name, last_name, gender, birth_date) AS local2, "
+        "  pprl_tokenize_token3(first_name, last_name, gender, birth_date) AS local3 "
+        "FROM patients) "
         "SELECT patient_id, "
-        "pprl_transcrypt_out(pprl_tokenize_token1(first_name, last_name, gender, birth_date)) AS token1, "
-        "pprl_transcrypt_out(pprl_tokenize_token2(first_name, last_name, gender, birth_date)) AS token2, "
-        "pprl_transcrypt_out(pprl_tokenize_token3(first_name, last_name, gender, birth_date)) AS token3 "
-        "FROM patients"
+        "pprl_transcrypt_out(local1) AS token1, "
+        "pprl_transcrypt_out(local2) AS token2, "
+        "pprl_transcrypt_out(local3) AS token3, "
+        "pprl_stable_diff_key(local1) AS diff_key "
+        "FROM t"
     ).fetchall()
     con.close()
-    return {pid: {"token1": t1, "token2": t2, "token3": t3} for pid, t1, t2, t3 in rows}
+    return {
+        pid: {"token1": t1, "token2": t2, "token3": t3, "_diff_key": dk}
+        for pid, t1, t2, t3, dk in rows
+    }
 
 
 def run(raw_lake_dir: str | Path = "data/lake/raw", work_dir: str | Path = "data/work",
@@ -341,6 +411,11 @@ def export_site_roster(patients: list[dict], site_dir: str | Path, central_publi
     token_map = tokenize_and_transcrypt(patients, site_priv, central_pub)
 
     out_path = site_dir / "patient.parquet"
-    rows = [{"local_patient_id": pid, **tokens} for pid, tokens in token_map.items()]
+    # Underscore-prefixed keys are site-local (currently `_diff_key`) and must not
+    # cross the boundary -- same exclusion stage8_package.py applies.
+    rows = [
+        {"local_patient_id": pid, **{k: v for k, v in tokens.items() if not k.startswith("_")}}
+        for pid, tokens in token_map.items()
+    ]
     pq.write_table(pa.Table.from_pylist(rows), out_path)
     return out_path

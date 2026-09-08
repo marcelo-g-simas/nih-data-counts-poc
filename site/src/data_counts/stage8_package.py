@@ -51,8 +51,11 @@ def _apply_tokens(deid_dir: Path, token_map: dict[str, dict[str, str]], out_dir:
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect()
+    # Underscore-prefixed keys (`_diff_key`) are site-local refresh bookkeeping, not
+    # payload -- dropped here so no `SELECT`-widening below can ever emit them.
     con.register("token_map", pa.Table.from_pylist([
-        {"patient_id": pid, **tokens} for pid, tokens in token_map.items()
+        {"patient_id": pid, **{k: v for k, v in tokens.items() if not k.startswith("_")}}
+        for pid, tokens in token_map.items()
     ]))
     counts = {}
     internal_cols = ", ".join(_INTERNAL_ONLY_COLUMNS)
@@ -81,6 +84,32 @@ def _apply_tokens(deid_dir: Path, token_map: dict[str, dict[str, str]], out_dir:
         counts[domain] = con.execute(f"SELECT count(*) FROM read_parquet('{out_path.as_posix()}')").fetchone()[0]
     con.close()
     return counts
+
+
+def _stable_content_digest(deid_dir: Path, token_map: dict[str, dict[str, str]],
+                            table_names: list[str]) -> str:
+    """Content identity for a snapshot, computed from inputs that are stable across
+    reruns -- the de-identified source tables plus the site-local stable token keys.
+
+    Deliberately NOT computed over the packaged Parquet: those files embed the
+    ephemeral tokens, and transcrypt_out re-randomizes every token on every call
+    (RSA-OAEP seeding), so a digest over the package would differ on every run
+    even with byte-identical inputs. That made the idempotent-rerun path in `run()`
+    unreachable and minted a spurious refresh each time. The de-identified inputs
+    are byte-stable, and `_diff_key` is stable for as long as the site key is, so
+    hashing those two gives the "same input + same DRS => same snapshot_id"
+    property the docstring claims. Per-file digests of the actual packaged bytes
+    are still recorded in the manifest for transport integrity.
+    """
+    h = hashlib.sha256()
+    for name in sorted(table_names):
+        src = deid_dir / f"{name}.parquet"
+        if src.exists():
+            h.update(name.encode())
+            h.update(_table_sha256(src).encode())
+    for diff_key in sorted(tokens["_diff_key"] for tokens in token_map.values()):
+        h.update(diff_key.encode())
+    return h.hexdigest()
 
 
 def _diff_against_previous(request_dir: Path, current_tokens: set[str]) -> dict:
@@ -116,7 +145,7 @@ def run(deid_dir: str | Path, token_map: dict[str, dict[str, str]], request_id: 
         shutil.rmtree(tmp_out)
     table_counts = _apply_tokens(deid_dir, token_map, tmp_out)
     table_hashes = {name: _table_sha256(tmp_out / f"{name}.parquet") for name in table_counts}
-    snapshot_id = hashlib.sha256(json.dumps(table_hashes, sort_keys=True).encode()).hexdigest()[:16]
+    snapshot_id = _stable_content_digest(deid_dir, token_map, list(table_counts))[:16]
 
     existing_manifest = request_dir / snapshot_id / "manifest.json"
     if existing_manifest.exists():
@@ -128,10 +157,14 @@ def run(deid_dir: str | Path, token_map: dict[str, dict[str, str]], request_id: 
 
     refresh_manifests = sorted(request_dir.glob("*/manifest.json"))
     refresh_id = f"r{len(refresh_manifests) + 1}"
-    # token1's ephemeral value is the per-record identity key for refresh diffing --
-    # site-local and deterministic per patient, though only the central platform (with
-    # its private key) can ever resolve what it actually links to.
-    diff = _diff_against_previous(request_dir, {tokens["token1"] for tokens in token_map.values()})
+    # `_diff_key` -- NOT the ephemeral token1 -- is the per-record identity key for
+    # refresh diffing. The ephemeral token cannot serve here: transcrypt_out wraps
+    # each token in RSA-OAEP, which mixes in a fresh random seed per call, so an
+    # unchanged patient gets a brand-new token1 every run. Diffing on it reported
+    # the entire cohort as added-and-deleted on every refresh. `_diff_key` is a
+    # site-local SHA-256 of the pre-transcrypt token, stable for as long as the
+    # site key is (see stage6_pprl.stable_diff_key and generate_site_keys).
+    diff = _diff_against_previous(request_dir, {tokens["_diff_key"] for tokens in token_map.values()})
 
     manifest = {
         "schema_version": SCHEMA_VERSION,
