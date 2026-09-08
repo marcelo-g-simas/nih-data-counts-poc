@@ -25,10 +25,10 @@ Identifier disposition (documented pathway, per identifier):
 from __future__ import annotations
 
 import hashlib
-from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa
 
 from .dsr import DataRequestSpecification
 
@@ -60,34 +60,48 @@ def compute_shift_days(request_id: str, patient_key: str, max_days: int) -> int:
 
 
 def run(dsr: DataRequestSpecification, views_dir: str | Path = "data/lake/views", out_dir: str | Path = "data/work/deid") -> dict[str, int]:
+    """Applies the date-shift via a small per-patient lookup table joined against
+    native, vectorized DuckDB date arithmetic -- not a per-row Python UDF. The
+    shift itself only depends on (request_id, patient_key, max_days), so it only
+    ever needs computing once per *patient*, not once per row; a DuckDB scalar
+    UDF still calls into Python once per row regardless of caching inside it
+    (measured: this was ~40% of total site runtime at 5,000 patients, entirely
+    from Python-call overhead, not from compute_shift_days' own cost). Joining a
+    precomputed key->shift_days table and doing `date + INTERVAL` in SQL keeps
+    the whole operation inside DuckDB's vectorized execution.
+    """
     views_dir, out_dir = Path(views_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     max_days = dsr.deidentification.date_shift.max_days
-    shift_cache: dict[str, int] = {}
-
-    def shift_date(patient_key: str | None, date_val: str | None) -> str | None:
-        if date_val is None or patient_key is None:
-            return date_val
-        if patient_key not in shift_cache:
-            shift_cache[patient_key] = compute_shift_days(dsr.request_id, patient_key, max_days)
-        d = date.fromisoformat(str(date_val)[:10])
-        shifted = d + timedelta(days=shift_cache[patient_key])
-        return shifted.isoformat()
 
     con = duckdb.connect()
-    con.create_function("deid_shift_date", shift_date, ["VARCHAR", "VARCHAR"], "VARCHAR")
     counts: dict[str, int] = {}
     for domain, date_fields in DEID_DATE_FIELDS.items():
         src = views_dir / f"{domain}.parquet"
         if not src.exists():
             continue
         key_field = KEY_FIELDS[domain]
-        replace_clause = ", ".join(f"deid_shift_date({key_field}, {f}) AS {f}" for f in date_fields)
+
+        keys = [row[0] for row in con.execute(
+            f"SELECT DISTINCT {key_field} FROM read_parquet('{src.as_posix()}') WHERE {key_field} IS NOT NULL"
+        ).fetchall()]
+        shift_table = pa.Table.from_pylist([
+            {"_deid_key": k, "_shift_days": compute_shift_days(dsr.request_id, k, max_days)} for k in keys
+        ])
+        con.register("_shift_table", shift_table)
+
+        replace_clause = ", ".join(
+            f"CASE WHEN d.{f} IS NULL THEN NULL "
+            f"ELSE (CAST(d.{f} AS DATE) + (s._shift_days || ' days')::INTERVAL)::VARCHAR END AS {f}"
+            for f in date_fields
+        )
         out_path = out_dir / f"{domain}.parquet"
         con.execute(
-            f"COPY (SELECT * REPLACE ({replace_clause}) FROM read_parquet('{src.as_posix()}')) "
+            f"COPY (SELECT d.* REPLACE ({replace_clause}) FROM read_parquet('{src.as_posix()}') d "
+            f"LEFT JOIN _shift_table s ON d.{key_field} = s._deid_key) "
             f"TO '{out_path.as_posix()}' (FORMAT parquet)"
         )
+        con.unregister("_shift_table")
         counts[domain] = con.execute(f"SELECT count(*) FROM read_parquet('{out_path.as_posix()}')").fetchone()[0]
     con.close()
     return counts

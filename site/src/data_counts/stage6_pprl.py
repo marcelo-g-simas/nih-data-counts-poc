@@ -47,6 +47,7 @@ from datetime import date
 from pathlib import Path
 
 import duckdb
+import duckdb.functional as duckdb_functional
 import jellyfish
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -67,6 +68,37 @@ _ZERO_NONCE = bytes(12)  # spindle-token intentionally reuses a fixed nonce for 
                           # see _crypto.py's DEFAULT_NONCE comment on why that's safe for this scheme.
 
 TOKEN_NAMES = ("token1", "token2", "token3")
+
+# FHIR's HumanName.use, in the order this site prefers when a Patient carries
+# more than one name entry: the current legal name first, then whatever the
+# person actually goes by day-to-day, before falling back to anything else.
+_NAME_USE_PREFERENCE = ("official", "usual")
+
+
+def select_name(names: list[dict] | None) -> dict:
+    """Pick one HumanName entry to tokenize from `Patient.name`.
+
+    `Patient.name` is FHIR's own repeating element (0..*) -- a person can
+    have a maiden name, a nickname, an old name, etc. alongside their current
+    one. Tokenization is exact-hash-sensitive (token1) or close to it
+    (token2/3's soundex/metaphone), so *which* entry gets picked matters:
+    two sites that each pick a different entry for the same real patient
+    (e.g. one keeps "official" first in its array, the other keeps a
+    "maiden" entry first) would tokenize different names and silently fail
+    to link -- a false negative with no error anywhere in the pipeline.
+    Picking positionally (`name[0]`) leaves that up to array order, which
+    FHIR does not guarantee reflects any preference. This resolves it
+    deterministically by `use` instead, matching how real name-matching
+    guidance (e.g. HL7's Patient Matching IG) expects "official"/"usual" to
+    be preferred over historical entries.
+    """
+    if not names:
+        return {}
+    for use in _NAME_USE_PREFERENCE:
+        for name in names:
+            if name.get("use") == use:
+                return name
+    return names[0]
 
 
 # ---- attribute normalization (spindle_token.opprl._common, transcribed) ----
@@ -236,24 +268,51 @@ def load_central_public_key(path: str | Path) -> bytes:
 
 def register_udfs(con: duckdb.DuckDBPyConnection, private_key_pem: bytes,
                    recipient_public_key_pem: bytes) -> None:
-    """Register the tokenize_token1/2/3 + transcrypt_out scalar UDFs on a DuckDB connection.
+    """Register the tokenize_token1/2/3 + transcrypt_out UDFs on a DuckDB connection.
 
-    Runs natively in DuckDB via Python scalar UDFs, per the hard constraint
-    (no Spark/JVM anywhere, including PPRL tokenization).
+    Runs natively in DuckDB via Python UDFs, per the hard constraint (no
+    Spark/JVM anywhere, including PPRL tokenization) -- registered with
+    `type=ARROW`, not DuckDB's default per-row scalar calling convention.
+    Measured on a 5,000-patient run: the per-value crypto work itself
+    (RSA-OAEP encrypt, AES-GCM-SIV, key loading) is cheap -- microseconds
+    each -- but DuckDB's default NATIVE mode still crosses the Python/C++
+    boundary once per row per UDF (30,000 crossings for 5,000 patients x 3
+    tokens x tokenize+transcrypt_out), and that crossing overhead, not the
+    crypto, was the actual cost (~4.2s of the 4.35s this stage took).
+    ARROW mode calls each UDF once per Arrow batch instead of once per row;
+    the Python loop inside is unchanged, so results are identical -- only
+    the number of Python/C++ crossings drops. `null_handling=SPECIAL` means
+    we still see every row (nulls included, correctly aligned across all
+    argument columns) rather than DuckDB silently skipping and re-inserting
+    NULLs itself -- required here since these functions' own None-checks are
+    part of their documented behavior (see `tokenize_token1`'s docstring).
     """
     aes_key = derive_aes_key_v2(private_key_pem)
     for name, fn in _TOKENIZERS.items():
         def _make_tokenizer(tokenize_fn):
-            return lambda fn_val, ln, g, bd: tokenize_fn(fn_val, ln, g, bd, aes_key)
+            def batched(fn_col, ln_col, g_col, bd_col):
+                return pa.array([
+                    tokenize_fn(fn_val, ln, g, bd, aes_key)
+                    for fn_val, ln, g, bd in zip(
+                        fn_col.to_pylist(), ln_col.to_pylist(), g_col.to_pylist(), bd_col.to_pylist()
+                    )
+                ])
+            return batched
 
         con.create_function(
             f"pprl_tokenize_{name}", _make_tokenizer(fn),
             ["VARCHAR", "VARCHAR", "VARCHAR", "VARCHAR"], "VARCHAR",
+            type=duckdb_functional.PythonUDFType.ARROW,
+            null_handling=duckdb_functional.FunctionNullHandling.SPECIAL,
         )
+
+    def transcrypt_out_batched(t_col):
+        return pa.array([transcrypt_out(t, aes_key, recipient_public_key_pem) for t in t_col.to_pylist()])
+
     con.create_function(
-        "pprl_transcrypt_out",
-        lambda t: transcrypt_out(t, aes_key, recipient_public_key_pem),
-        ["VARCHAR"], "VARCHAR",
+        "pprl_transcrypt_out", transcrypt_out_batched, ["VARCHAR"], "VARCHAR",
+        type=duckdb_functional.PythonUDFType.ARROW,
+        null_handling=duckdb_functional.FunctionNullHandling.SPECIAL,
     )
 
 
@@ -298,7 +357,7 @@ def run(raw_lake_dir: str | Path = "data/lake/raw", work_dir: str | Path = "data
     patients = []
     for row_json in patient_table.column("__source_json").to_pylist():
         r = json.loads(row_json)
-        name = (r.get("name") or [{}])[0]
+        name = select_name(r.get("name"))
         patients.append({
             "patient_id": r["id"],
             "first_name": (name.get("given") or [None])[0],

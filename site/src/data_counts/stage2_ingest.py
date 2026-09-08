@@ -57,7 +57,9 @@ def fetch_bulk_export(source_ndjson_dir: str | Path, dest_dir: str | Path, fhir_
     return dest
 
 
-def land_raw_parquet(ndjson_dir: str | Path, raw_out_dir: str | Path) -> dict[str, int]:
+def land_raw_parquet(
+    ndjson_dir: str | Path, raw_out_dir: str | Path
+) -> tuple[dict[str, int], dict[str, list[dict]]]:
     """Land each resource type as nested, lossless Parquet. [Req 1a, 6]
 
     Schema is derived by cumulus-fhir-support's `pyarrow_schema_from_rows`
@@ -68,10 +70,18 @@ def land_raw_parquet(ndjson_dir: str | Path, raw_out_dir: str | Path) -> dict[st
     traceable-to-source metadata -- so the encoding is guaranteed
     byte-for-byte round-trippable regardless of which choice-type/extension
     edge cases the derived typed schema does or doesn't cover.
+
+    Also returns the parsed resources by type, already in memory here --
+    `build_analytic_views()` needs the identical dicts to walk via
+    ViewDefinitions, and passing them straight through lets `run()` skip
+    re-reading+`json.loads`-ing the `__source_json` column it just wrote
+    (a full extra JSON decode pass over every resource otherwise). Callers
+    that only want the Parquet side effect can ignore the second value.
     """
     ndjson_dir, raw_out_dir = Path(ndjson_dir), Path(raw_out_dir)
     raw_out_dir.mkdir(parents=True, exist_ok=True)
     counts: dict[str, int] = {}
+    resources_by_type: dict[str, list[dict]] = {}
     for rt in RESOURCE_TYPES:
         rows = list(cfs.read_multiline_json_from_dir(str(ndjson_dir), resource=rt))
         if not rows:
@@ -94,11 +104,25 @@ def land_raw_parquet(ndjson_dir: str | Path, raw_out_dir: str | Path) -> dict[st
         table = pa.Table.from_arrays(arrays, schema=schema)
         pq.write_table(table, raw_out_dir / f"{rt}.parquet")
         counts[rt] = len(rows)
-    return counts
+        resources_by_type[rt] = rows
+    return counts, resources_by_type
 
 
-def build_analytic_views(raw_dir: str | Path, views_out_dir: str | Path) -> dict[str, int]:
-    """Project the lossless raw layer into flat tables via ViewDefinitions. [Req 6]"""
+def build_analytic_views(
+    raw_dir: str | Path,
+    views_out_dir: str | Path,
+    resources_by_type: dict[str, list[dict]] | None = None,
+) -> dict[str, int]:
+    """Project the lossless raw layer into flat tables via ViewDefinitions. [Req 6]
+
+    `resources_by_type`, when given, is used instead of re-reading Parquet
+    and re-`json.loads`-ing `__source_json` -- the caller (typically `run()`,
+    right after `land_raw_parquet()`) already holds the identical parsed
+    dicts, so this skips a redundant full JSON-decode pass over every
+    resource. Falls back to reading from `raw_dir` when called standalone
+    (e.g. against an already-landed raw lake, or in isolation from tests/the
+    stage-2b CLI subcommand).
+    """
     raw_dir, views_out_dir = Path(raw_dir), Path(views_out_dir)
     views_out_dir.mkdir(parents=True, exist_ok=True)
     counts: dict[str, int] = {}
@@ -106,11 +130,16 @@ def build_analytic_views(raw_dir: str | Path, views_out_dir: str | Path) -> dict
     for view_path in sorted(FHIR_VIEWS_DIR.glob("*.json")):
         view_def = json.loads(view_path.read_text())
         resource_type = view_def["resource"]
-        raw_parquet = raw_dir / f"{resource_type}.parquet"
-        if not raw_parquet.exists():
-            continue
-        table = pq.read_table(raw_parquet)
-        resources = [json.loads(s) for s in table.column("__source_json").to_pylist()]
+        if resources_by_type is not None:
+            resources = resources_by_type.get(resource_type)
+            if resources is None:
+                continue
+        else:
+            raw_parquet = raw_dir / f"{resource_type}.parquet"
+            if not raw_parquet.exists():
+                continue
+            table = pq.read_table(raw_parquet)
+            resources = [json.loads(s) for s in table.column("__source_json").to_pylist()]
         flat_rows = evaluate_view(view_def, resources)
         if not flat_rows:
             continue
@@ -127,6 +156,6 @@ def run(ndjson_dir: str | Path = "data/synthea_ndjson", lake_dir: str | Path = "
     lake_dir = Path(lake_dir)
     fetch_dir = lake_dir / "_fetched_ndjson"
     fetch_bulk_export(ndjson_dir, fetch_dir, fhir_url=fhir_url)
-    raw_counts = land_raw_parquet(fetch_dir, lake_dir / "raw")
-    view_counts = build_analytic_views(lake_dir / "raw", lake_dir / "views")
+    raw_counts, resources_by_type = land_raw_parquet(fetch_dir, lake_dir / "raw")
+    view_counts = build_analytic_views(lake_dir / "raw", lake_dir / "views", resources_by_type=resources_by_type)
     return {"raw": raw_counts, "views": view_counts}

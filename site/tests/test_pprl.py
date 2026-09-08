@@ -1,6 +1,7 @@
 from data_counts.stage6_pprl import (
     derive_aes_key_v2,
     generate_site_keys,
+    select_name,
     tokenize_token1,
     tokenize_token2,
     tokenize_token3,
@@ -53,6 +54,28 @@ def test_token2_and_token3_still_differ_for_unrelated_names(tmp_path):
         tokenize_token2("Bob", "Baker", "M", "1985-06-15", key)
     assert tokenize_token3("Alice", "Anders", "F", "1990-01-01", key) != \
         tokenize_token3("Bob", "Baker", "M", "1985-06-15", key)
+
+
+def test_select_name_prefers_official_over_array_position():
+    # "maiden" listed first, "official" second -- a naive name[0] pick would
+    # grab the wrong one and tokenize a name the patient no longer goes by.
+    names = [
+        {"use": "maiden", "family": "Smith", "given": ["Jane"]},
+        {"use": "official", "family": "Jones", "given": ["Jane"]},
+    ]
+    assert select_name(names)["family"] == "Jones"
+
+
+def test_select_name_falls_back_to_usual_then_first_entry():
+    assert select_name([{"use": "old", "family": "A"}, {"use": "usual", "family": "B"}])["family"] == "B"
+    # no official/usual entry at all -- fall back to whatever's there, not an error.
+    assert select_name([{"use": "old", "family": "A"}])["family"] == "A"
+    assert select_name([{"family": "NoUseTag"}])["family"] == "NoUseTag"
+
+
+def test_select_name_handles_missing_name():
+    assert select_name(None) == {}
+    assert select_name([]) == {}
 
 
 def test_transcrypt_out_is_decryptable_only_by_the_recipient(tmp_path):
