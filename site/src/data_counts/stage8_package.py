@@ -102,9 +102,9 @@ def _diff_against_previous(request_dir: Path, current_tokens: set[str]) -> dict:
 
 def run(deid_dir: str | Path, token_map: dict[str, dict[str, str]], request_id: str,
         outbox_dir: str | Path = "outbox") -> dict:
-    """Idempotent by content: an identical rerun (same DSR + unchanged source)
+    """Idempotent by content: an identical rerun (same DRS + unchanged source)
     reproduces the same snapshot_id and returns the existing manifest rather
-    than minting a new refresh, satisfying "same input + same DSR => byte-
+    than minting a new refresh, satisfying "same input + same DRS => byte-
     identical outputs" without accumulating spurious refresh entries.
     """
     deid_dir, outbox_dir = Path(deid_dir), Path(outbox_dir)

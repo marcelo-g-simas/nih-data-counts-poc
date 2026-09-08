@@ -44,22 +44,30 @@ Philter, because resolving and linking tokens never requires touching a raw iden
 
 ## 2. RFI requirement coverage
 
+What follows is what an actual run produces, per requirement. It is deliberately not the complete
+coverage picture: **[`REQUIREMENTS.md`](REQUIREMENTS.md) is the authoritative index**, keyed by RFI
+requirement number, and it additionally carries the architecture-only requirements (7, 10, 12, 14),
+an explicit `implemented` / `partial` / `architecture-only` status per requirement, the named gap
+behind every `partial`, and a Known divergences section listing where this POC and the write-up
+knowingly disagree. A test (`site/tests/test_requirements_sync.py`) asserts that index agrees with
+what `make demo` prints, so the two can't drift.
+
 | Req | Where | Example from an actual run |
 |---|---|---|
 | 1a | `stage1_synthea.py`, `stage2_ingest.py` | 100-patient synthetic cohort generated, landed as nested Parquet |
 | 1b, 9 | `audit.py`, `stage9_audit.py` | Every stage appends `{timestamp, stage_id, batch_id, record_counts, outcome, reconciliation_status}` to `data/work/audit_log.jsonl` |
-| 2 | `dsr.py`, `stage3_dsr.py` | `dsr/examples/DC-POC-0001.json` validated; missing/ambiguous fields flagged, never silently substituted |
+| 2 | `drs.py`, `stage3_drs.py` | `drs/examples/DC-POC-0001.json` validated; missing/ambiguous fields flagged, never silently substituted |
 | 3 | `stage4_dq_kahn.py` | Kahn-framework checks (completeness, uniqueness, data type, date sequencing, records-per-patient) — see §3 |
 | 4 | `stage5_deid.py` | 18 identifiers removed, per-patient date-shift — see §4 for a real gap found and fixed here |
 | 5 | `stage6_pprl.py` + `central/` | OPPRL v2 token1/2/3, cross-site Splink linkage — see §5, the core of this report |
 | 6 | `stage2_ingest.py`, `fhir_views/*.json` | Lossless raw Parquet layer + traceable flat analytic views, round-trip tested |
 | 8, 15 | `stage8_package.py` | Versioned, idempotent package to `outbox/`; refresh-cycle diffing |
-| 11 | `stage9_audit.py`, `security_audit.py`, `hash_chain.py` (both projects) | Pinned model versions/hashes + DSR version logged; hash-chained CEF security audit log, tamper detection demonstrated — see §6 |
+| 11 | `stage9_audit.py`, `security_audit.py`, `hash_chain.py` (both projects) | Pinned model versions/hashes + DRS version logged; hash-chained CEF security audit log, tamper detection demonstrated — see §6 |
 | 13 | `stage7_leak_gate.py` | Independent QA gate (Presidio + Philter + GLiNER); halts and routes to `review_queue/` on any hit |
 
 ## 3. Example: data-quality checks (Req 3)
 
-A single run against the example DSR's five checks, over a 100-patient cohort:
+A single run against the example DRS's five checks, over a 100-patient cohort:
 
 | Check | Kahn category | Result |
 |---|---|---|
@@ -75,10 +83,10 @@ All five passed on this run (`any_dq_anomaly: false` in `data/work/qa_manifest.j
 
 ## 4. Example: a real de-identification gap, found and fixed (Req 4, 13)
 
-While verifying that `birth_date` and `gender` remaining in de-identified output was compliant —
-it is: `gender` isn't one of the 18 Safe Harbor identifiers, and `birth_date` is genuinely
-per-patient date-shifted (`1992-05-13` → `1991-12-01`, not left untouched), which is exactly what
-the RFI's Req 4 text asks for verbatim ("apply a per-patient date-shifting specification that
+While verifying that `birth_date` and `gender` remaining in de-identified output was what Req 4 asks
+for — it is: `gender` isn't one of the 18 identifiers enumerated at §164.514(b)(2), and `birth_date`
+is genuinely per-patient date-shifted (`1992-05-13` → `1991-12-01`, not left untouched), which is
+the requirement's own language verbatim ("apply a per-patient date-shifting specification that
 preserves temporal order") — inspecting the actual packaged output surfaced something worse: every
 outbound table carried a raw internal resource `id` right alongside the patient's token. For the
 patient table, that `id` **was the exact un-tokenized value the token existed to replace**:
@@ -244,3 +252,13 @@ them just indexes them as extra searchable fields.
 - The hash-chained logs (§6) are tamper-*evident*, not tamper-*proof*: a local attacker with
   filesystem access to both the log and its chain-head sidecar could still hide an edit by
   recomputing the whole chain. Real write-once guarantees need external anchoring this POC doesn't have.
+- **The output is not Safe Harbor de-identified**, and stage 5 does not claim it is. It removes all
+  18 identifiers enumerated at §164.514(b)(2), which is necessary but not sufficient: §164.514(c)
+  allows a re-identification code only if it is "not derived from or related to information about
+  the individual," and a PPRL token is by construction a keyed hash of name/gender/DOB. Safe Harbor
+  also requires dates be reduced to year only, where this pipeline day-shifts them to preserve
+  temporal order per Req 4. Both are consequences of the program's own linkage (Req 5) and
+  longitudinal-research goals, not gaps. The defensible characterizations are a **Limited Data Set**
+  under a DUA (§164.514(e)) or **de-identified by Expert Determination** (§164.514(b)(1)) — an NIH
+  program-level determination, which the write-up's §10 raises as an open question rather than
+  assuming. See `site/src/data_counts/stage5_deid.py`'s module docstring.

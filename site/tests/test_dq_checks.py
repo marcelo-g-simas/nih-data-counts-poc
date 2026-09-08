@@ -1,7 +1,7 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data_counts.dsr import DQCheck
+from data_counts.drs import DQCheck
 from data_counts.stage4_dq_kahn import run as run_checks
 
 

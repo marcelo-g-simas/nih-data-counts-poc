@@ -1,9 +1,9 @@
-"""Stage 3 support: Data Request Specification (DSR) schema + validation.
+"""Stage 3 support: Data Request Specification (DRS) schema + validation.
 
-The DSR is the single JSON document that drives the whole pipeline: cohort
+The DRS is the single JSON document that drives the whole pipeline: cohort
 logic, requested fields, date range, mode/cadence, de-id parameters, and the
 list of DQ checks to run on-site (stage 4 reads `checks[]` directly). See
-dsr/examples/DC-POC-0001.json for a concrete instance. [Req 2]
+drs/examples/DC-POC-0001.json for a concrete instance. [Req 2]
 """
 from __future__ import annotations
 

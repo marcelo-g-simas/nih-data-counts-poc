@@ -42,6 +42,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 from datetime import date
 from pathlib import Path
@@ -67,6 +68,20 @@ _ZERO_NONCE = bytes(12)  # spindle-token intentionally reuses a fixed nonce for 
                           # see _crypto.py's DEFAULT_NONCE comment on why that's safe for this scheme.
 
 TOKEN_NAMES = ("token1", "token2", "token3")
+
+# The program's public key is the one input this pipeline needs from outside its
+# own project. The repo-relative default works for a source checkout, where
+# `central/` is a sibling directory; it cannot work inside the container image,
+# where nothing above /app exists. DATA_COUNTS_CENTRAL_PUBLIC_KEY is how a
+# containerized or otherwise relocated deployment points at a mounted key --
+# which is also the realistic shape of it, since at a real site the program's
+# key arrives as a file the operator installs, not as a sibling checkout.
+CENTRAL_PUBLIC_KEY_ENV = "DATA_COUNTS_CENTRAL_PUBLIC_KEY"
+DEFAULT_CENTRAL_PUBLIC_KEY = "../central/keys/central_public_key.pem"
+
+
+def default_central_public_key_path() -> str:
+    return os.environ.get(CENTRAL_PUBLIC_KEY_ENV) or DEFAULT_CENTRAL_PUBLIC_KEY
 
 
 # ---- attribute normalization (spindle_token.opprl._common, transcribed) ----
@@ -281,7 +296,7 @@ def tokenize_and_transcrypt(patients: list[dict], site_priv: bytes, central_pub:
 
 
 def run(raw_lake_dir: str | Path = "data/lake/raw", work_dir: str | Path = "data/work",
-        central_public_key_path: str | Path = "../central/keys/central_public_key.pem",
+        central_public_key_path: str | Path | None = None,
         site_keys_dir: str | Path | None = None) -> dict[str, dict[str, str]]:
     """Single-site tokenization for the main pipeline: identifying attributes
     are read from the *raw* (identifiable) lake layer -- never from the
@@ -292,7 +307,7 @@ def run(raw_lake_dir: str | Path = "data/lake/raw", work_dir: str | Path = "data
     """
     raw_dir, work_dir = Path(raw_lake_dir), Path(work_dir)
     site_priv, _ = generate_site_keys(site_keys_dir or (work_dir / "pprl" / "site"))
-    central_pub = load_central_public_key(central_public_key_path)
+    central_pub = load_central_public_key(central_public_key_path or default_central_public_key_path())
 
     patient_table = pq.read_table(raw_dir / "Patient.parquet")
     patients = []

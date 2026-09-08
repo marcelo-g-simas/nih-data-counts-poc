@@ -9,7 +9,7 @@ from pathlib import Path
 
 import duckdb
 
-from .dsr import DQCheck
+from .drs import DQCheck
 
 
 def _table_ref(views_dir: Path, domain: str) -> str:

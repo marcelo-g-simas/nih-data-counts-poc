@@ -27,7 +27,7 @@ from .viewdef import evaluate_view
 
 FHIR_VIEWS_DIR = Path(__file__).resolve().parent.parent.parent / "fhir_views"
 
-# DSR domain names (dsr/examples/*.json, Kahn checks) use "medication", not the FHIR
+# DRS domain names (drs/examples/*.json, Kahn checks) use "medication", not the FHIR
 # resource type "MedicationRequest" -- this maps analytic-view output filenames accordingly.
 RESOURCE_TO_DOMAIN = {
     "Patient": "patient",

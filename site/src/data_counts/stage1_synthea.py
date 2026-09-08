@@ -1,15 +1,15 @@
 """Stage 1: synthetic EHR generation + bulk-export endpoint. [Req 1a]
 
-Primary path: shell out to the official MITRE Synthea Docker image
-(`--use-docker`) to generate a FHIR R4 NDJSON cohort. That image is large and
-a 1,000-patient run can take a long time to pull/run, so the default path
+Primary path: shell out to the official MITRE Synthea container image
+(`--use-container`) to generate a FHIR R4 NDJSON cohort. That image is large
+and a 1,000-patient run can take a long time to pull/run, so the default path
 (no flag needed) is a deterministic, seeded, pure-Python FHIR R4 generator
 that emits the same per-resource-type NDJSON shape Synthea's bulk-export
 produces (Patient/Condition/Observation/Encounter/MedicationRequest.ndjson).
 Either way, the output folder is what stage 2 treats as "the bulk-export
 endpoint's payload" — Synthea's own docs note the NDJSON-folder and live
 `$export` paths are interchangeable for a downstream consumer, so this POC
-takes the simpler one by default and documents docker as a drop-in swap.
+takes the simpler one by default and documents the container as a drop-in swap.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from faker import Faker
 RESOURCE_TYPES = ["Patient", "Condition", "Observation", "Encounter", "MedicationRequest"]
 
 # A handful of real code systems/codes so downstream DQ/cohort logic has
-# something real to filter on (E11.x = Type 2 diabetes, matches the example DSR).
+# something real to filter on (E11.x = Type 2 diabetes, matches the example DRS).
 CONDITION_CODES = [
     ("http://hl7.org/fhir/sid/icd-10-cm", "E11.9", "Type 2 diabetes mellitus without complications"),
     ("http://hl7.org/fhir/sid/icd-10-cm", "I10", "Essential (primary) hypertension"),
@@ -63,7 +63,7 @@ def _opaque_id(rng: random.Random) -> str:
 
 
 def generate_synthetic_fallback(out_dir: Path, population: int, seed: int) -> dict[str, int]:
-    """Deterministic pure-Python FHIR R4 cohort generator (no Java/Docker needed)."""
+    """Deterministic pure-Python FHIR R4 cohort generator (no Java or container runtime needed)."""
     rng = random.Random(seed)
     fake = Faker()
     Faker.seed(seed)
@@ -153,14 +153,34 @@ def generate_synthetic_fallback(out_dir: Path, population: int, seed: int) -> di
     return counts
 
 
-def generate_with_docker(out_dir: Path, population: int) -> bool:
-    """Try the real MITRE Synthea Docker image. Returns False if docker/image is unavailable."""
-    if shutil.which("docker") is None:
-        return False
+# podman first: it is the reference engine for the leave-behind artifact (see
+# Containerfile), and preferring it here keeps the one place this POC shells out
+# to a container runtime consistent with how the pipeline itself is packaged.
+# docker is kept as a fallback so a site that has standardized on it still works.
+CONTAINER_ENGINES = ("podman", "docker")
+
+
+def resolve_container_engine() -> str | None:
+    """First available engine from CONTAINER_ENGINES, or None if neither is installed."""
+    for engine in CONTAINER_ENGINES:
+        if shutil.which(engine) is not None:
+            return engine
+    return None
+
+
+def generate_with_container(out_dir: Path, population: int) -> str | None:
+    """Try the real MITRE Synthea image. Returns the engine used, or None if unavailable."""
+    engine = resolve_container_engine()
+    if engine is None:
+        return None
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
-        "docker", "run", "--rm",
-        "-v", f"{out_dir.resolve()}:/output",
+        engine, "run", "--rm",
+        # :Z applies a private SELinux label (needed on the RHEL-family hosts
+        # podman is native to, no-op elsewhere). Synthea writes as root inside
+        # the container; under rootless podman that lands as the invoking user
+        # on the host, so no --userns mapping is needed for this one-shot.
+        "-v", f"{out_dir.resolve()}:/output:Z",
         "mitre/synthea",
         "-p", str(population),
         "--exporter.fhir.export", "true",
@@ -168,15 +188,16 @@ def generate_with_docker(out_dir: Path, population: int) -> bool:
     ]
     try:
         subprocess.run(cmd, check=True, timeout=1800)
-        return True
+        return engine
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-        return False
+        return None
 
 
-def run(out_dir: str | Path = "data/synthea_ndjson", population: int = 1000, seed: int = 42, use_docker: bool = False) -> dict[str, Any]:
+def run(out_dir: str | Path = "data/synthea_ndjson", population: int = 1000, seed: int = 42, use_container: bool = False) -> dict[str, Any]:
     out_path = Path(out_dir)
-    if use_docker and generate_with_docker(out_path, population):
-        source = "mitre/synthea (docker)"
+    engine = generate_with_container(out_path, population) if use_container else None
+    if engine is not None:
+        source = f"mitre/synthea ({engine})"
         counts = {rt: sum(1 for _ in (out_path / f"{rt}.ndjson").open()) for rt in RESOURCE_TYPES if (out_path / f"{rt}.ndjson").exists()}
     else:
         counts = generate_synthetic_fallback(out_path, population, seed)

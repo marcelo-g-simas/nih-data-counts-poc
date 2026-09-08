@@ -48,3 +48,8 @@ probabilities per token.
 | `evaluation.py` | Precision/recall/F1 against a synthetic-demo-only ground truth |
 | `security_audit.py`, `hash_chain.py` | Req 11: hash-chained, CEF-formatted security audit log (`security_audit.cef.log`) — `setup-keys`/`link` invocations, key generation. `make verify-logs` detects tampering. Duplicated from `../site/`'s copy, same rationale as `crypto.py`. |
 | `cli.py` | `setup-keys`, `link`, `verify-logs` |
+
+This project is the central half of Req 5 and Req 15, and carries its own copy of Req 11. For a
+status per RFI requirement across both projects — including the `architecture-only` ones that have
+no code counterpart, and the specific gap behind each `partial` — see
+**[`../REQUIREMENTS.md`](../REQUIREMENTS.md)**, which is the authoritative index.

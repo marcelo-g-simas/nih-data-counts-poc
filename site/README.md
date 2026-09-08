@@ -13,7 +13,7 @@ raw identifiable attribute runs here; `../central/` never sees one.
 - **CPU only, no GPU** — nothing in this pipeline (de-id, GLiNER, Presidio) requests a GPU device.
 - **No Spark, no JVM** — pure Python + DuckDB end to end, including PPRL tokenization (see the
   Stage 6 note below on why that required a documented deviation from a literal reading of the spec).
-- **Deterministic and reproducible** — same input + same DSR ⇒ byte-identical outputs and tokens
+- **Deterministic and reproducible** — same input + same DRS ⇒ byte-identical outputs and tokens
   (see `tests/test_reproducibility.py`). Model versions and seeds are pinned and logged.
 - **Source is never modified** — DQ checks (stage 4) report only; de-id (stage 5) writes to
   `data/work/deid/`, a derived copy. `data/lake/` is read-only after stage 2.
@@ -36,25 +36,31 @@ make test
 |---|---|---|
 | 1a | `stage1_synthea.py`, `stage2_ingest.py` (2a) | Extraction from an EMR-shaped source via a FHIR Bulk Data `$export`-style NDJSON payload, pulled with `smart-fetch` |
 | 1b | `audit.py` | Per-stage provenance/audit record on every batch |
-| 2 | `dsr.py`, `stage3_dsr.py` | DSR-driven orchestration; flags gaps, never silently substitutes |
+| 2 | `drs.py`, `stage3_drs.py` | DRS-driven orchestration; flags gaps, never silently substitutes |
 | 3 | `stage4_dq_kahn.py`, halt path in `cli.py` | Kahn-framework DQ checks (conformance/completeness/plausibility); halt on unresolved anomaly |
-| 4 | `stage5_deid.py` | 18 HIPAA identifiers (45 CFR §164.514(b)) removed; per-patient order-preserving date-shift |
+| 4 | `stage5_deid.py` | 18 HIPAA identifiers (45 CFR §164.514(b)(2)) removed; per-patient order-preserving date-shift. Not a Safe Harbor claim — see the module docstring and `../REPORT.md` §8 |
 | 5 | `stage6_pprl.py` (site half: tokenize + transcrypt_out); see `../central/` for the resolution + linkage half | OPPRL v2 tokenization (token1/2/3), DuckDB-native |
 | 6 | `stage2_ingest.py` (2a/2b), `fhir_views/*.json`, `viewdef.py` | Lossless, round-trippable raw Parquet layer + traceable flat analytic views |
 | 8 | `stage8_package.py` | Versioned package, idempotent reruns, added/updated/deleted tracking |
 | 9 | `audit.py`, `stage9_audit.py` | Processing audit trail (per-stage record counts/outcome/reconciliation) + PII-free, k-anonymized (k=11) QA manifest |
-| 11 | `stage9_audit.py` (model versions), `security_audit.py`, `hash_chain.py` | Model versions/hashes + DSR version logged; hash-chained, CEF-formatted security audit log (auth/admin/config-change/security events) protected against undetected tampering -- `make verify-logs` |
+| 11 | `stage9_audit.py` (model versions), `security_audit.py`, `hash_chain.py` | Model versions/hashes + DRS version logged; hash-chained, CEF-formatted security audit log (auth/admin/config-change/security events) protected against undetected tampering -- `make verify-logs` |
 | 13 | `stage7_leak_gate.py` | Independent residual-PII QA gate (Presidio + Philter + GLiNER); halts on any hit |
 | 15 | `stage8_package.py` | Refresh-cycle diffing across snapshots |
 
 Run `make demo` to see a human-readable version of this table (`data/work/rfi_summary.txt`),
 generated from the actual run.
 
+This table covers what this project implements. For the full picture — including the
+architecture-only requirements (7, 10, 12, 14) that have no code counterpart, a status per
+requirement, and the specific gap behind each `partial` — see **[`../REQUIREMENTS.md`](../REQUIREMENTS.md)**,
+which is the authoritative index. `tests/test_requirements_sync.py` asserts that it agrees with
+`stage9_audit.RFI_MAP`, so the index and the demo output can't drift apart.
+
 ## Repo layout
 
 ```
-src/data_counts/   stage1_synthea.py … stage9_audit.py, dsr.py, viewdef.py, audit.py, cli.py
-dsr/examples/      example Data Request Specification
+src/data_counts/   stage1_synthea.py … stage9_audit.py, drs.py, viewdef.py, audit.py, cli.py
+drs/examples/      example Data Request Specification
 fhir_views/        SQL-on-FHIR ViewDefinition JSON, one per resource type
 data/              gitignored: lake/ (raw/ lossless + views/ analytic), work/, review_queue/
 models/            gitignored: downloaded model artifacts
@@ -148,5 +154,43 @@ doesn't know what they mean just indexes them as ordinary searchable fields.
 
 No Java/JVM is available in every deployment target, so the default cohort generator
 (`stage1_synthea.py`) is a deterministic, seeded, pure-Python FHIR R4 generator that emits the same
-per-resource-type NDJSON shape Synthea's own bulk-export produces. Pass `--use-docker` to instead
-run the real MITRE Synthea Docker image — the downstream pipeline is identical either way.
+per-resource-type NDJSON shape Synthea's own bulk-export produces. Pass `--use-container` to instead
+run the real MITRE Synthea image — the downstream pipeline is identical either way. That path
+resolves `podman` first and falls back to `docker` (`CONTAINER_ENGINES`), matching the packaging
+choice below.
+
+## Packaging: podman is the reference engine
+
+`make image-build` / `image-run` / `image-save` build and run the leave-behind artifact from
+`Containerfile`. **Podman is the default engine**, for three reasons that map onto the RFI rather
+than onto taste:
+
+- **Daemonless.** There is no root-owned socket, so letting trained site staff operate the pipeline
+  (Req 1) does not mean granting them a root-equivalent capability. Under Docker, membership in the
+  `docker` group is effectively root on the host.
+- **Rootless by default.** The container runs as an unprivileged user in a user namespace, which
+  keeps Req 12a's attack-surface minimization and Req 13's "identifiable processing confined to the
+  Healthcare Partner's VM, no contractor remote-management pathway" honest — there is no long-lived
+  privileged service listening for anyone at all, contractor or otherwise.
+- **Already present.** Podman ships in the RHEL/Rocky/Alma base repositories that most Healthcare
+  Partner VMs run, so the artifact installs without adding a third-party package repository.
+
+Nothing in the image is podman-specific: `Containerfile` is plain Dockerfile syntax with no
+BuildKit-only directives, and `make ENGINE=docker image-build` produces the same image. Two flags
+in the Makefile *are* engine-conditional and are commented as such — `--userns=keep-id` (rootless
+podman maps container uid 1000 to a subuid, not to the invoking user, so bind mounts would otherwise
+be unwritable) and `save --format oci-archive` (podman defaults to a docker-archive; `docker save`
+has no `--format` flag at all).
+
+For air-gapped sites, `make image-save` writes an OCI archive that either engine can `load`. Pin the
+`FROM` lines by digest before shipping for real — the Containerfile notes where — so rebuilds are
+byte-identical.
+
+**No key material is baked into the image.** Stage 6 needs exactly one input from outside this
+project: the *program's* RSA public key, which it encrypts site tokens under. In a source checkout
+that resolves as a sibling path (`../central/keys/`); inside the image nothing above `/app` exists,
+so `image-run` mounts it read-only at `/app/keys/` and points `DATA_COUNTS_CENTRAL_PUBLIC_KEY` at it.
+Override the host path with `make CENTRAL_PUBLIC_KEY=/path/to/key.pem image-run`. This is also the
+realistic shape of it: at a real site the program's public key arrives as a file the operator
+installs, not as a sibling checkout. The *site's* own private key is generated locally and never
+leaves — nothing in the packaging path transmits or embeds it.

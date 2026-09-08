@@ -4,6 +4,8 @@ models/
 inbox/
 keys/
 linkage_ground_truth.json
+# `make image-save` output: the air-gapped distribution archive (multi-GB)
+*.tar
 security_audit.cef.log
 security_audit.cef.log.chainhead
 .venv/

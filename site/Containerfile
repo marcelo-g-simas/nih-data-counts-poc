@@ -1,10 +1,14 @@
-# syntax=docker/dockerfile:1
+# Multi-stage OCI build for the Data COUNTS leave-behind pipeline POC.
 #
-# Multi-stage build for the Data COUNTS leave-behind pipeline POC.
+# Named Containerfile (podman/buildah's default) because podman is the
+# reference engine for the leave-behind artifact -- daemonless and rootless,
+# so operating it needs no root-owned socket. Nothing here is podman-specific:
+# it is plain Dockerfile syntax with no BuildKit-only directives, so
+# `make ENGINE=docker image-build` produces the same image. See site/Makefile.
 #
 # Stage "builder" runs `uv sync` and the online model-download/export step
 # (the same thing `make setup` does on a bare host) once, at build time --
-# so the final image is offline-ready from `docker run` onward with no
+# so the final image is offline-ready from `podman run` onward with no
 # separate setup step, which is a better fit for a "leave-behind" artifact
 # than requiring a live run first. Pin FROM by digest before shipping this
 # for real (see README's Packaging section) for byte-identical rebuilds.
@@ -40,6 +44,9 @@ RUN uv sync --frozen
 # The directory must exist *before* nltk.download() runs: nltk only picks a
 # download destination from among the paths that already exist and are
 # writable, so setting NLTK_DATA alone (without creating it) is a no-op.
+# Note this path is OUTSIDE /app, so the runtime stage must copy it explicitly
+# (see the second COPY --from=builder below) -- copying /app alone leaves the
+# taggers behind and stage 7's Philter detector fails at run time.
 ENV NLTK_DATA=/usr/local/share/nltk_data
 RUN mkdir -p "$NLTK_DATA" && uv run data-counts setup-models
 
@@ -53,16 +60,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
 WORKDIR /app
 COPY --from=builder --chown=datacounts:datacounts /app /app
 
-ENV PATH="/app/.venv/bin:${PATH}" \
-    PYTHONUNBUFFERED=1
+# The nltk taggers Philter needs live outside /app (see NLTK_DATA in the builder
+# stage), so they need their own COPY -- root-owned and world-readable, since
+# they are read-only reference data the runtime never writes to. NLTK_DATA must
+# be re-declared: ENV does not carry across build stages.
+COPY --from=builder /usr/local/share/nltk_data /usr/local/share/nltk_data
 
-# data/, outbox/ hold run state and output; dsr/ can be overridden with a
-# real partner-site DSR. None of this should be baked into the image.
+ENV PATH="/app/.venv/bin:${PATH}" \
+    PYTHONUNBUFFERED=1 \
+    NLTK_DATA=/usr/local/share/nltk_data
+
+# data/, outbox/ hold run state and output; drs/ can be overridden with a
+# real partner-site DRS; keys/ is the mount point for the *program's* public key
+# (stage 6's only external input -- see DATA_COUNTS_CENTRAL_PUBLIC_KEY in
+# stage6_pprl.py, and the image-run target that mounts it read-only). No key
+# material of any kind is baked into the image; none of this should be.
 # Created and chowned as root, before dropping privileges -- the datacounts
 # user doesn't have write access to create them itself under /app.
-RUN mkdir -p data/lake/raw data/lake/views data/work data/review_queue outbox \
-    && chown -R datacounts:datacounts data outbox
-VOLUME ["/app/data", "/app/outbox", "/app/dsr"]
+RUN mkdir -p data/lake/raw data/lake/views data/work data/review_queue outbox keys \
+    && chown -R datacounts:datacounts data outbox keys
+VOLUME ["/app/data", "/app/outbox", "/app/drs"]
 
 USER datacounts
 

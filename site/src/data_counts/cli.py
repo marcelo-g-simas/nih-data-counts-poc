@@ -14,7 +14,7 @@ from rich import print as rprint
 from . import (
     stage1_synthea,
     stage2_ingest,
-    stage3_dsr,
+    stage3_drs,
     stage4_dq_kahn,
     stage5_deid,
     stage6_pprl,
@@ -61,8 +61,8 @@ def setup_models():
 
 
 @app.command("stage1-synthea")
-def cli_stage1(out: str = "data/synthea_ndjson", population: int = 1000, seed: int = 42, use_docker: bool = False):
-    result = stage1_synthea.run(out, population=population, seed=seed, use_docker=use_docker)
+def cli_stage1(out: str = "data/synthea_ndjson", population: int = 1000, seed: int = 42, use_container: bool = False):
+    result = stage1_synthea.run(out, population=population, seed=seed, use_container=use_container)
     rprint(result)
 
 
@@ -74,7 +74,7 @@ def cli_stage2(ndjson_dir: str = "data/synthea_ndjson", lake_dir: str = "data/la
 
 @app.command("export-linkage-demo-sites")
 def export_linkage_demo_sites(
-    central_public_key_path: str = "../central/keys/central_public_key.pem",
+    central_public_key_path: str = stage6_pprl.DEFAULT_CENTRAL_PUBLIC_KEY,
     inbox_dir: str = "../central/inbox",
     ground_truth_path: str = "../linkage_ground_truth.json",
 ):
@@ -158,7 +158,7 @@ def verify_logs(work_dir: str = "data/work"):
 
 
 @app.command("run-all")
-def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
+def run_all(drs: str = "drs/examples/DC-POC-0001.json", population: int = 1000):
     audit_log = AuditLog()
     seclog = SecurityAuditLog()
     seclog.log_event(category="authentication", name="CLI invocation", user=_operator,
@@ -182,32 +182,32 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
         rprint(f"  [green]✓[/green] {sum(s2['raw'].values())} records landed as nested Parquet (data/lake/raw/)")
         rprint(f"  [green]✓[/green] {sum(s2['views'].values())} rows projected into flat analytic views (data/lake/views/)")
 
-        rprint("[bold cyan]Stage 3/9 — DSR orchestration[/bold cyan] [dim](Req 2)[/dim]")
-        s3 = stage3_dsr.run(dsr)
-        request_id = s3["dsr"].request_id
+        rprint("[bold cyan]Stage 3/9 — DRS orchestration[/bold cyan] [dim](Req 2)[/dim]")
+        s3 = stage3_drs.run(drs)
+        request_id = s3["drs"].request_id
         availability = s3["availability"]
-        rprint(f"  [dim]request_id:[/dim] {s3['dsr'].request_id}  [dim]version:[/dim] {s3['dsr'].version}  "
-               f"[dim]cadence:[/dim] {s3['dsr'].refresh_cadence}")
+        rprint(f"  [dim]request_id:[/dim] {s3['drs'].request_id}  [dim]version:[/dim] {s3['drs'].version}  "
+               f"[dim]cadence:[/dim] {s3['drs'].refresh_cadence}")
         if availability["missing_domains"] or availability["missing_fields"]:
             rprint(f"  [yellow]⚠ availability gaps (no silent substitution): {availability}[/yellow]")
         else:
             rprint("  [green]✓[/green] every requested domain/field is present — nothing silently substituted")
-        audit_log.record(stage_id="stage3_dsr", batch_id=s3["dsr"].request_id, record_counts={},
+        audit_log.record(stage_id="stage3_drs", batch_id=s3["drs"].request_id, record_counts={},
                           outcome="ok", reconciliation_status="ok", extra=availability)
         seclog.log_event(
-            category="configuration_change", name="DSR loaded", user=_operator, action="load DSR",
-            resource=dsr, outcome="success",
-            message=f"request_id={s3['dsr'].request_id} version={s3['dsr'].version} "
-                    f"permission_version={s3['dsr'].authorization.permission_version}",
+            category="configuration_change", name="DRS loaded", user=_operator, action="load DRS",
+            resource=drs, outcome="success",
+            message=f"request_id={s3['drs'].request_id} version={s3['drs'].version} "
+                    f"permission_version={s3['drs'].authorization.permission_version}",
         )
 
         rprint("[bold cyan]Stage 4/9 — Data quality (Kahn framework)[/bold cyan] [dim](Req 3)[/dim]")
-        s4 = stage4_dq_kahn.run(s3["dsr"].checks)
+        s4 = stage4_dq_kahn.run(s3["drs"].checks)
         for check in s4["checks"]:
             mark = "[red]✗[/red]" if check["anomaly"] else "[green]✓[/green]"
             rprint(f"  {mark} {check['id']} ({check['kahn_category']}/{check['type']}, on_fail={check['on_fail']})")
         audit_log.record(
-            stage_id="stage4_dq_kahn", batch_id=s3["dsr"].request_id,
+            stage_id="stage4_dq_kahn", batch_id=s3["drs"].request_id,
             record_counts={c["id"]: int(not c["anomaly"]) for c in s4["checks"]},
             outcome="halt" if s4["halt"] else "ok", reconciliation_status="anomaly_report_emitted",
             extra=s4,
@@ -216,13 +216,13 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
         Path("data/work/dq_anomaly_report.json").write_text(json.dumps(s4, indent=2))
         if s4["halt"]:
             seclog.log_event(category="security_event", name="DQ halt", user=_operator,
-                              action="stage4_dq_kahn", resource=s3["dsr"].request_id, outcome="halted",
+                              action="stage4_dq_kahn", resource=s3["drs"].request_id, outcome="halted",
                               message="on_fail=halt check failed; transmission blocked")
             raise PipelineHalt(f"DQ check(s) failed with on_fail=halt: {s4}")
 
         rprint("[bold cyan]Stage 5/9 — De-identification[/bold cyan] [dim](Req 4)[/dim]")
-        s5 = stage5_deid.run(s3["dsr"])
-        audit_log.record(stage_id="stage5_deid", batch_id=s3["dsr"].request_id, record_counts=s5,
+        s5 = stage5_deid.run(s3["drs"])
+        audit_log.record(stage_id="stage5_deid", batch_id=s3["drs"].request_id, record_counts=s5,
                           outcome="ok", reconciliation_status="ok")
         rprint(f"  [green]✓[/green] 18 HIPAA identifiers removed; per-patient date-shift applied across {len(s5)} domains "
                f"({sum(s5.values())} rows)")
@@ -230,7 +230,7 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
         rprint("[bold cyan]Stage 6/9 — OPPRL tokenization[/bold cyan] [dim](Req 5, site half only — tokenize + transcrypt_out)[/dim]")
         tokens = stage6_pprl.run()
         audit_log.record(
-            stage_id="stage6_pprl", batch_id=s3["dsr"].request_id, record_counts={"patients_tokenized": len(tokens)},
+            stage_id="stage6_pprl", batch_id=s3["drs"].request_id, record_counts={"patients_tokenized": len(tokens)},
             outcome="ok", reconciliation_status="ok",
         )
         seclog.log_event(
@@ -249,25 +249,25 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
         # both are acceptance criteria, and conflating them would make one impossible to show.
         real_notes: list[dict] = []
         rprint("  [dim]scanning the real outbound batch (0 free-text notes in this cohort — expected clean)...[/dim]")
-        s7 = stage7_leak_gate.run(real_notes, batch_id=s3["dsr"].request_id)
+        s7 = stage7_leak_gate.run(real_notes, batch_id=s3["drs"].request_id)
         audit_log.record(
-            stage_id="stage7_leak_gate", batch_id=s3["dsr"].request_id,
+            stage_id="stage7_leak_gate", batch_id=s3["drs"].request_id,
             record_counts={"flagged": len(s7["flagged"])},
             outcome="halt" if s7["halt"] else "ok", reconciliation_status="scanned",
         )
         if s7["halt"]:
             rprint(f"[red]Residual PII leak detected -- routed to {s7.get('review_path')}. Halting transmission.[/red]")
             seclog.log_event(category="security_event", name="Residual PII leak", user=_operator,
-                              action="stage7_leak_gate", resource=s3["dsr"].request_id, outcome="halted",
+                              action="stage7_leak_gate", resource=s3["drs"].request_id, outcome="halted",
                               message=f"routed to {s7.get('review_path')}")
             raise PipelineHalt("Unresolved residual PII leak")
         rprint("  [green]✓[/green] real outbound batch: clean, 0 detectors fired")
 
         rprint("  [dim]scanning a deliberately injected-PII fixture (Presidio + Philter + GLiNER, recall-tuned)...[/dim]")
         injected_leak_notes = [{"id": "note-injected-leak", "note_text": "Patient Jane Q. Doe, DOB 1980-05-12, SSN 123-45-6789, reachable at jane.doe@example.com."}]
-        s7_demo = stage7_leak_gate.run(injected_leak_notes, batch_id=f"{s3['dsr'].request_id}-leak-demo")
+        s7_demo = stage7_leak_gate.run(injected_leak_notes, batch_id=f"{s3['drs'].request_id}-leak-demo")
         audit_log.record(
-            stage_id="stage7_leak_gate_demo", batch_id=f"{s3['dsr'].request_id}-leak-demo",
+            stage_id="stage7_leak_gate_demo", batch_id=f"{s3['drs'].request_id}-leak-demo",
             record_counts={"flagged": len(s7_demo["flagged"])},
             outcome="halt" if s7_demo["halt"] else "ok", reconciliation_status="scanned",
         )
@@ -281,7 +281,7 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
             rprint("  [yellow]⚠ injected-leak demo did not trigger a halt -- detectors may be unavailable (run `make setup`).[/yellow]")
 
         rprint("[bold cyan]Stage 8/9 — Package + transmit[/bold cyan] [dim](Req 8, 15)[/dim]")
-        s8 = stage8_package.run("data/work/deid", tokens, s3["dsr"].request_id)
+        s8 = stage8_package.run("data/work/deid", tokens, s3["drs"].request_id)
         audit_log.record(stage_id="stage8_package", batch_id=s8["snapshot_id"], record_counts=s8["tables"],
                           outcome="ok", reconciliation_status="ok")
         rprint(f"  [dim]snapshot:[/dim] {s8['snapshot_id']}  [dim]refresh:[/dim] {s8['refresh_id']}")
@@ -294,8 +294,8 @@ def run_all(dsr: str = "dsr/examples/DC-POC-0001.json", population: int = 1000):
         record_counts = {**s1["counts"], **s2["raw"]}
         qa_manifest = stage9_audit.build_qa_manifest(record_counts, s4, s7)
         stage9_audit.write_qa_manifest(qa_manifest)
-        stage9_audit.write_rfi_summary(s3["dsr"].request_id, s3["dsr"].version, halted=False)
-        stage9_audit.log_model_versions(audit_log, s3["dsr"].version)
+        stage9_audit.write_rfi_summary(s3["drs"].request_id, s3["drs"].version, halted=False)
+        stage9_audit.log_model_versions(audit_log, s3["drs"].version)
         rprint("  [green]✓[/green] audit trail, PII-free QA manifest, and RFI summary written to data/work/")
         rprint("  [dim]→ run `data-counts verify-logs` to confirm neither log has been tampered with[/dim]")
 

@@ -3,8 +3,15 @@
 > **SYNTHETIC DATA ONLY. No real PHI is generated, stored, or processed anywhere in this repository.**
 
 A proof-of-concept in support of a response to NIH RFI **75N95C26R00005 (Data COUNTS™)** (see
-`rfi/`). See **[REPORT.md](REPORT.md)** for a full narrative walkthrough of the POC, including
-worked examples and the linkage evaluation metrics.
+`rfi/`).
+
+- **[REQUIREMENTS.md](REQUIREMENTS.md)** — start here. The authoritative index keyed by RFI
+  requirement number, joining each requirement to the write-up section that answers it, the module
+  that implements it, and an honest status (`implemented` / `partial` / `architecture-only`), plus a
+  Known divergences section. The write-up is organized by requirement number and this repo is
+  organized by pipeline stage; that file is the join key that keeps them from drifting apart.
+- **[REPORT.md](REPORT.md)** — a full narrative walkthrough of the POC, including worked examples
+  and the linkage evaluation metrics.
 
 ## Two projects, deliberately
 
@@ -39,5 +46,6 @@ make verify-logs    # Req 11: confirm both projects' hash-chained logs are untam
 make test           # both projects' test suites
 ```
 
-See `site/README.md` for the full RFI-requirement-to-module map, and `central/README.md` for
-why Splink is the right tool for turning OPPRL's binary tokens into graded match confidence.
+See `REQUIREMENTS.md` for the full RFI-requirement-to-module map (and `site/README.md` for the
+site-project subset of it), and `central/README.md` for why Splink is the right tool for turning
+OPPRL's binary tokens into graded match confidence.

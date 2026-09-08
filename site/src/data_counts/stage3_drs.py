@@ -1,6 +1,6 @@
-"""Stage 3: DSR-driven orchestration. [Req 2]
+"""Stage 3: DRS-driven orchestration. [Req 2]
 
-Loads the DSR, validates requested domains/fields against what the lake
+Loads the DRS, validates requested domains/fields against what the lake
 actually contains, flags gaps (never silently substitutes), and returns the
 context (request_id, resolved domains) later stages stamp onto every output.
 """
@@ -10,22 +10,22 @@ from pathlib import Path
 
 import duckdb
 
-from .dsr import DataRequestSpecification
+from .drs import DataRequestSpecification
 
 
-def validate_availability(dsr: DataRequestSpecification, views_dir: str | Path) -> dict:
-    """Check DSR-requested domains/fields against what's present in the analytic views.
+def validate_availability(drs: DataRequestSpecification, views_dir: str | Path) -> dict:
+    """Check DRS-requested domains/fields against what's present in the analytic views.
 
     Returns a report with `missing_domains` and `missing_fields` -- these are
     surfaced, never silently dropped or substituted.
     """
     views_dir = Path(views_dir)
     available_tables = {p.stem for p in views_dir.glob("*.parquet")}
-    missing_domains = [d for d in dsr.domains if d not in available_tables]
+    missing_domains = [d for d in drs.domains if d not in available_tables]
 
     missing_fields = []
     con = duckdb.connect()
-    for field in dsr.fields:
+    for field in drs.fields:
         table_path = views_dir / f"{field.domain}.parquet"
         if not table_path.exists():
             missing_fields.append(f"{field.domain}.{field.name}")
@@ -36,14 +36,14 @@ def validate_availability(dsr: DataRequestSpecification, views_dir: str | Path) 
     con.close()
 
     return {
-        "request_id": dsr.request_id,
+        "request_id": drs.request_id,
         "missing_domains": missing_domains,
         "missing_fields": missing_fields,
         "ambiguous": [],
     }
 
 
-def run(dsr_path: str | Path, lake_dir: str | Path = "data/lake") -> dict:
-    dsr = DataRequestSpecification.load(dsr_path)
-    report = validate_availability(dsr, Path(lake_dir) / "views")
-    return {"dsr": dsr, "availability": report}
+def run(drs_path: str | Path, lake_dir: str | Path = "data/lake") -> dict:
+    drs = DataRequestSpecification.load(drs_path)
+    report = validate_availability(drs, Path(lake_dir) / "views")
+    return {"drs": drs, "availability": report}
