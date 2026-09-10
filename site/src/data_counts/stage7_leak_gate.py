@@ -8,22 +8,25 @@ CPU-only), and Philter (fully offline regex/POS-based clinical text
 de-identifier). Tuned for recall over precision: ANY hit from ANY detector
 halts transmission of that batch and routes it to data/review_queue/.
 
-GLiNER / ONNX Runtime note: `gliner`'s own ONNX support (`export_to_onnx()` /
-`from_pretrained(..., load_onnx_model=True)`, added in gliner>=0.2.24) still
-imports PyTorch unconditionally at the package level -- verified directly
-against the installed source (model.py, onnx/model.py, and decoding/decoder.py
-all `import torch` for tokenization/collation/decoding glue), so this does
-not shrink the dependency footprint. What it *does* give is a real inference
-speedup: the fp32 ONNX export matched the PyTorch model's predictions exactly
-(bit-for-bit scores) on our test text while running the encoder forward pass
-through ONNX Runtime instead of PyTorch eager mode, ~1.7x faster. We use that
-fp32 export, not the INT8-quantized one `export_to_onnx(quantize=True)` also
-produces -- the quantized model measurably regressed recall in our own
-comparison (it missed a date-of-birth entity the fp32/PyTorch models both
-caught, and shifted other entity boundaries), which is a bad trade for a
-detector whose whole design brief is recall over precision. The one-time
-export itself still needs PyTorch (see `export_gliner_onnx()`); that's a
-`setup-models` step, not a run-time one.
+GLiNER / runtime note: this used to load GLiNER through the `gliner` package's
+own ONNX support, which -- verified directly against its installed source --
+still imports PyTorch unconditionally at the package level (model.py,
+onnx/model.py, decoding/decoder.py all `import torch` for tokenization/
+collation/decoding glue), so it never actually shrank the dependency
+footprint; PyTorch, transformers, and onnx were all still real runtime
+dependencies. We instead now load the identical `onnx-community/
+gliner_small-v2.1` checkpoint (a community fp32 ONNX export of the same
+`urchade/gliner_small-v2.1` weights this pipeline always used) through
+`fast_gliner` (github.com/talmago/fast_gliner), a Rust (`gline-rs`) + ONNX
+Runtime binding whose only dependency is `huggingface_hub` -- no PyTorch,
+transformers, or onnx package anywhere, at setup time or run time. Verified,
+not assumed: a side-by-side comparison against the prior `gliner`+local-ONNX
+path over this module's own fixtures produced byte-identical entity spans
+and scores agreeing to 6 decimal places (same weights, different runtime), so
+this is a dependency-footprint and speed change, not a detector-behavior
+change -- ~1.5-1.6x faster per call in our own measurement (the README's
+"~4x vs PyTorch" claim isn't the applicable comparison, since we were already
+on ONNX Runtime, not eager PyTorch, before this switch).
 
 Encoder NER only -- no vLLM or any generative-LLM serving stack anywhere.
 """
@@ -32,21 +35,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-# Silences a benign transformers/tokenizers warning that fires on every GLiNER call:
-# gliner's own processor.py (data_processing/processor.py) calls the tokenizer with
-# truncation=True but no max_length, and the DeBERTa-v3-small tokenizer it uses has no
-# model_max_length set -- so transformers logs "Asking to truncate... Default to no
-# truncation" once per invocation. Harmless (our inputs are short; nothing is actually
-# truncated either way) and entirely internal to gliner's tokenization pipeline, not
-# something we call directly -- verbosity is the right lever, not a warnings filter,
-# since this is a transformers logger message, not a Python warnings.warn().
-import transformers  # noqa: E402
-transformers.logging.set_verbosity_error()
-
-GLINER_MODEL_ID = "urchade/gliner_small-v2.1"
+GLINER_MODEL_ID = "onnx-community/gliner_small-v2.1"
 GLINER_LABELS = ["person", "phone number", "email", "address", "date of birth", "social security number", "medical record number"]
 GLINER_ONNX_DIR = Path("models/gliner_onnx")
-GLINER_ONNX_FILE = "model.onnx"  # fp32; see module docstring for why not the INT8 export
+# Path *within* GLINER_ONNX_DIR once populated -- mirrors the onnx-community repo's own
+# layout (an `onnx/` subdirectory), which is also fast_gliner's default `onnx_path`.
+GLINER_ONNX_SUBPATH = "onnx/model.onnx"
 # Presidio's own default nlp engine config wants en_core_web_lg (large, slow to fetch);
 # pin it to the small model instead. It's a real pinned dependency in pyproject.toml
 # (see the `[tool.uv.sources]` comment there for why), so plain `uv sync` installs it.
@@ -72,30 +66,37 @@ def _get_presidio():
 
 
 def export_gliner_onnx(save_dir: str | Path = GLINER_ONNX_DIR) -> dict:
-    """One-time, online export step (part of `setup-models`): download the PyTorch
-    checkpoint and export it to ONNX (fp32 + an INT8 side-export for reference/
-    comparison; the fp32 file is what the pipeline actually loads -- see module
-    docstring for why). After this, `_get_gliner()` never needs PyTorch again.
+    """One-time, online download step (part of `setup-models`): pull the
+    community fp32 ONNX export (tokenizer/config files + `onnx/model.onnx`
+    only -- not the int8/fp16/bnb4/q4 variants also in that repo, to keep the
+    offline model directory small and unambiguous) so `_get_gliner()` never
+    needs network access again. No PyTorch/export step involved -- the ONNX
+    file is already built upstream; this only downloads it.
     """
-    from gliner import GLiNER
-    model = GLiNER.from_pretrained(GLINER_MODEL_ID)
-    return model.export_to_onnx(save_dir=str(save_dir), onnx_filename=GLINER_ONNX_FILE, quantize=True)
+    from huggingface_hub import snapshot_download
+    save_dir = Path(save_dir)
+    local_dir = snapshot_download(
+        repo_id=GLINER_MODEL_ID,
+        local_dir=str(save_dir),
+        allow_patterns=["*.json", "*.model", "*.txt", GLINER_ONNX_SUBPATH],
+    )
+    return {"onnx_path": str(Path(local_dir) / GLINER_ONNX_SUBPATH)}
 
 
 def _get_gliner():
     global _gliner_model
     if _gliner_model is None:
-        from gliner import GLiNER
-        onnx_path = GLINER_ONNX_DIR / GLINER_ONNX_FILE
+        from fast_gliner import FastGLiNER
+        onnx_path = GLINER_ONNX_DIR / GLINER_ONNX_SUBPATH
         if onnx_path.exists():
-            # ONNX Runtime backend, CPU-only (ORT has no GPU execution provider configured).
-            _gliner_model = GLiNER.from_pretrained(
-                str(GLINER_ONNX_DIR), load_onnx_model=True, onnx_model_file=GLINER_ONNX_FILE
+            # Rust (gline-rs) + ONNX Runtime backend, CPU-only.
+            _gliner_model = FastGLiNER.from_pretrained(
+                str(GLINER_ONNX_DIR), onnx_path=GLINER_ONNX_SUBPATH, execution_provider="cpu"
             )
         else:
-            # Fallback for dev/test use before `setup-models` has run. Force CPU either way --
-            # no GPU anywhere in this pipeline, per the hard constraints.
-            _gliner_model = GLiNER.from_pretrained(GLINER_MODEL_ID).to("cpu")
+            # Fallback for dev/test use before `setup-models` has run -- resolves and
+            # downloads the model from the Hub on first use instead of failing.
+            _gliner_model = FastGLiNER.from_pretrained(model_id=GLINER_MODEL_ID, execution_provider="cpu")
     return _gliner_model
 
 

@@ -98,21 +98,31 @@ possibly-stale training data (as the spec itself warns to do):
 Everything else (`cumulus-fhir-support`, `aehrc/parquet-on-fhir` conformance, Presidio, Philter)
 matched the spec as written. GLiNER didn't quite — see below.
 
-## Stage 7: GLiNER via ONNX Runtime
+## Stage 7: GLiNER via fast_gliner (Rust/gline-rs), not the `gliner` package
 
-`gliner`'s own ONNX support (`export_to_onnx()` / `from_pretrained(..., load_onnx_model=True)`)
-does **not** drop PyTorch from the install: verified directly against the installed source, its
-`model.py`, `onnx/model.py`, and `decoding/decoder.py` all `import torch` unconditionally for
+This originally loaded GLiNER through the `gliner` package's own ONNX support
+(`export_to_onnx()` / `from_pretrained(..., load_onnx_model=True)`). That does **not** drop
+PyTorch from the install: verified directly against the installed source, its `model.py`,
+`onnx/model.py`, and `decoding/decoder.py` all `import torch` unconditionally for
 tokenization/collation/decoding glue, even when the encoder forward pass itself runs through ONNX
-Runtime. Torch stays a dependency either way (used for the one-time export in `setup-models`); what
-ONNX buys here is real inference speed (~1.7x faster on our test text, matching PyTorch's output
-bit-for-bit) at the same accuracy, not a smaller footprint.
+Runtime — so `torch`, `transformers`, and `onnx` were all real runtime dependencies either way.
 
-We export the **fp32** ONNX model, not the INT8-quantized one `export_to_onnx(quantize=True)` also
-produces. In our own side-by-side comparison the quantized model missed a date-of-birth entity that
-both the PyTorch and fp32-ONNX models caught, and shifted other entity boundaries — a bad trade for
-a detector whose whole design brief is recall over precision. `make setup` exports both; only the
-fp32 one is loaded by default (`stage7_leak_gate.GLINER_ONNX_FILE`).
+It now loads the same weights (`urchade/gliner_small-v2.1`) via `fast_gliner`
+(github.com/talmago/fast_gliner) — a Rust (`gline-rs`) + ONNX Runtime binding whose only
+dependency is `huggingface_hub` — pointed at `onnx-community/gliner_small-v2.1`, a community fp32
+ONNX export of the identical checkpoint. Verified, not assumed: a side-by-side comparison against
+the prior `gliner`+local-ONNX path over this module's own fixtures (the injected-leak demo text,
+both `tests/test_leak_gate.py` cases, plus a harder unlabeled-PII sentence) produced **byte-identical
+entity spans** and scores agreeing to 6 decimal places — same weights, different runtime — and
+~1.5-1.6x faster per call in our own measurement (the project's README claims "~4x vs PyTorch";
+that's not the applicable comparison here since we were already on ONNX Runtime, not eager
+PyTorch, before this switch). This drops `gliner`, `transformers`, `torch`, and `onnx` from
+`pyproject.toml` entirely, along with the PyTorch-CPU wheel-index workaround they required.
+
+We still avoid the quantized ONNX variants that repo also publishes (int8/fp16/bnb4/q4) — the
+INT8 GLiNER export we compared earlier missed a date-of-birth entity that fp32 caught, a bad
+trade for a detector whose whole design brief is recall over precision — `export_gliner_onnx()`
+only ever downloads `onnx/model.onnx` (fp32).
 
 ## Stage 8: a real de-identification gap, found and fixed
 

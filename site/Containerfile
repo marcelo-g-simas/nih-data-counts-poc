@@ -14,10 +14,20 @@
 # for real (see README's Packaging section) for byte-identical rebuilds.
 FROM python:3.11-slim AS builder
 
-# libgomp1: OpenMP runtime torch/onnxruntime's CPU kernels link against;
-# not always present on slim base images.
+# libgomp1: OpenMP runtime ONNX Runtime's CPU kernels (used by fast_gliner) link
+# against; not always present on slim base images.
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
+
+# Every `uv run`/`uv sync` step below imports Python modules (setup-models,
+# nltk.download, the package's own build), and without this each import
+# leaves a compiled .pyc behind under a __pycache__/ -- ~25MB of build-time
+# litter that would otherwise ride into the final image (measured directly:
+# `find /app/.venv -name __pycache__` before this fix). Sets it here, before
+# any RUN that imports Python, so none of that ever gets written in the first
+# place -- cheaper than compiling then deleting, and carries into the runtime
+# stage's own ENV block below for the same reason at container start.
+ENV PYTHONDONTWRITEBYTECODE=1
 
 COPY --from=ghcr.io/astral-sh/uv:0.10.2 /uv /uvx /usr/local/bin/
 
@@ -50,6 +60,13 @@ RUN uv sync --frozen
 ENV NLTK_DATA=/usr/local/share/nltk_data
 RUN mkdir -p "$NLTK_DATA" && uv run data-counts setup-models
 
+# Strip each dependency's own bundled test suite (~16MB: blis, spacy, srsly,
+# fsspec, etc. all ship a tests/ package alongside their real code) -- dead
+# weight for a runtime image, never imported by the packages' own non-test
+# code paths. Verified safe by running the full test suite and a real
+# `run-all` inside the built image afterward, not assumed.
+RUN find /app/.venv/lib -type d \( -iname 'tests' -o -iname 'test' \) -prune -exec rm -rf {} +
+
 # ---------------------------------------------------------------------------
 FROM python:3.11-slim AS runtime
 
@@ -68,6 +85,7 @@ COPY --from=builder /usr/local/share/nltk_data /usr/local/share/nltk_data
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     NLTK_DATA=/usr/local/share/nltk_data
 
 # data/, outbox/ hold run state and output; drs/ can be overridden with a

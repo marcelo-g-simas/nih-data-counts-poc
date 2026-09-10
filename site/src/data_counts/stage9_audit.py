@@ -42,7 +42,7 @@ RFI_MAP = [
 ]
 
 PINNED_MODELS = {
-    "gliner": f"{stage7_leak_gate.GLINER_MODEL_ID} (ONNX Runtime, fp32, CPU)",
+    "gliner": f"{stage7_leak_gate.GLINER_MODEL_ID} (fast_gliner: Rust/gline-rs + ONNX Runtime, fp32, CPU)",
     "presidio_nlp_engine": stage7_leak_gate.PRESIDIO_SPACY_MODEL,
 }
 
