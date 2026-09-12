@@ -64,6 +64,8 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from spindle_token import generate_pem_keys
 
+from .drs import DataRequestSpecification, DateShift
+
 _ZERO_NONCE = bytes(12)  # spindle-token intentionally reuses a fixed nonce for AES-GCM-SIV;
                           # see _crypto.py's DEFAULT_NONCE comment on why that's safe for this scheme.
 
@@ -147,6 +149,68 @@ def derive_aes_key_v2(private_key_pem: bytes) -> bytes:
         encoding=Encoding.DER, format=PrivateFormat.PKCS8, encryption_algorithm=NoEncryption()
     )
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"opprl.v2.aes").derive(canonical)
+
+
+# ---- date-shift derivation (Req 4; this program's own, NOT part of OPPRL) ----
+#
+# Transcribed from `central/`'s `crypto.py`, the same way `derive_aes_key_v2`
+# above is transcribed from upstream: the two projects share no runtime code, so
+# a site and the central platform agree on a patient's offset by both
+# implementing the same construction. Keep the two copies identical -- if they
+# drift, dates silently stop lining up rather than failing loudly, which is the
+# worst failure mode available here.
+
+_LATTICE_QUANTUM_DAYS = 364  # 52 weeks; see central/crypto.derive_shift_days
+_DAYS_PER_WEEK = 7
+
+
+def token1_digest(first_name: str | None, last_name: str | None, gender: str | None,
+                   birth_date: str | None) -> bytes | None:
+    """The OPPRL token1 *plaintext* digest -- the per-identity date-shift key. [Req 4]
+
+    Exactly the value `_tokenize` hashes for token1, over the same normalized
+    attributes in the same sorted-attribute-id order, before AES encryption. It
+    is what the central platform recovers in `transcrypt_in`, which is precisely
+    why it is the shift key: it is the only value identical at every site for the
+    same person *and* available on both sides of the boundary.
+
+    Returns None on any missing attribute, matching `_tokenize` -- a patient with
+    no last name has no token1 and therefore no shift, and stage 5 excludes them
+    rather than inventing one.
+
+    This value never leaves the site. It is not packaged, not written to disk, and
+    not part of the token map; only the integer day count derived from it is. It
+    is also an unsalted digest over public, low-entropy attributes -- see
+    `REPORT.md` §9 for what that means and why it is a property of the OPPRL
+    protocol rather than of this transcription.
+    """
+    values = [
+        _normalize_birth_date(birth_date),
+        _first_char(_normalize_name(first_name)),
+        _normalize_gender(gender),
+        _normalize_name(last_name),
+    ]
+    if any(v is None for v in values):
+        return None
+    return hashlib.sha512(":".join(values).encode()).digest()
+
+
+def derive_shift_days(shift_key: bytes, token_digest: bytes, max_years: int, jitter_weeks: int) -> int:
+    """Season- and weekday-preserving day offset. [Req 4]
+
+    `364 * k + 7 * j` -- every term a whole number of weeks, which is what makes
+    the day of the week survive exactly. Transcribed from `central/`'s
+    `crypto.derive_shift_days`; that docstring carries the full reasoning for the
+    lattice, and both copies must produce identical output for identical input.
+    """
+    if max_years < 0 or jitter_weeks < 0:
+        raise ValueError("max_years and jitter_weeks must be non-negative")
+    material = HKDF(
+        algorithm=hashes.SHA256(), length=16, salt=None, info=b"data-counts.dateshift.days",
+    ).derive(shift_key + token_digest)
+    k = (int.from_bytes(material[:8], "big") % (2 * max_years + 1)) - max_years
+    j = (int.from_bytes(material[8:], "big") % (2 * jitter_weeks + 1)) - jitter_weeks
+    return _LATTICE_QUANTUM_DAYS * k + _DAYS_PER_WEEK * j
 
 
 # ---- tokenize / transcrypt_out (spindle_token.opprl.v0, transcribed) ----
@@ -329,7 +393,9 @@ def register_udfs(con: duckdb.DuckDBPyConnection, private_key_pem: bytes,
     con.create_function("pprl_stable_diff_key", stable_diff_key, ["VARCHAR"], "VARCHAR")
 
 
-def tokenize_and_transcrypt(patients: list[dict], site_priv: bytes, central_pub: bytes) -> dict[str, dict[str, str]]:
+def tokenize_and_transcrypt(patients: list[dict], site_priv: bytes, central_pub: bytes,
+                             date_shift: DateShift | None = None,
+                             drs_shift_key: bytes | None = None) -> dict[str, dict[str, str]]:
     """Tokenize a site's patient roster (dicts with first_name/last_name/gender/birth_date/patient_id)
     into all three token variants, then transcrypt_out each under the central platform's public key.
 
@@ -338,6 +404,14 @@ def tokenize_and_transcrypt(patients: list[dict], site_priv: bytes, central_pub:
     internal join key for building the return dict -- it is never itself
     transmitted anywhere; see stage8_package.py for how the outbound package
     drops it, along with the underscore-prefixed site-local `_diff_key`.
+
+    When `date_shift` and `drs_shift_key` are supplied, each entry also carries
+    `_shift_days`: the per-patient offset stage 5 applies to every date of that
+    patient (Req 4). Underscore-prefixed by the same convention as `_diff_key`,
+    which is what keeps it site-local -- `stage8_package.py` strips those keys
+    before packaging, so the offset is never transmitted even though the shifted
+    dates it produced are. Both arguments are optional so the linkage demo, which
+    exports a roster with no dates at all, needs no shift key.
     """
     con = duckdb.connect()
     register_udfs(con, site_priv, central_pub)
@@ -359,25 +433,84 @@ def tokenize_and_transcrypt(patients: list[dict], site_priv: bytes, central_pub:
         "FROM t"
     ).fetchall()
     con.close()
-    return {
+    token_map = {
         pid: {"token1": t1, "token2": t2, "token3": t3, "_diff_key": dk}
         for pid, t1, t2, t3, dk in rows
     }
 
+    if date_shift is not None and drs_shift_key is not None:
+        # Computed here in Python, from the roster, rather than as a DuckDB UDF:
+        # the digest is identity-bearing (REPORT.md §9), and a UDF would hand it
+        # across the Python/DuckDB boundary and into a query result for no gain.
+        # Only the derived integer reaches the token map.
+        for p in patients:
+            digest = token1_digest(p.get("first_name"), p.get("last_name"),
+                                    p.get("gender"), p.get("birth_date"))
+            entry = token_map.get(p["patient_id"])
+            if entry is None:
+                continue
+            entry["_shift_days"] = (
+                None if digest is None
+                else derive_shift_days(drs_shift_key, digest,
+                                        date_shift.max_years, date_shift.jitter_weeks)
+            )
+    return token_map
 
-def run(raw_lake_dir: str | Path = "data/lake/raw", work_dir: str | Path = "data/work",
+
+def load_drs_shift_key(path: str | Path) -> bytes:
+    """Read the per-DRS date-shift key, handed to the site out-of-band with the DRS. [Req 4]
+
+    Issued by `data-counts-central issue-drs-shift-key <request_id>`. Every site
+    responding to a given DRS receives the same key, which is what makes their
+    offsets agree; see `central/`'s `derive_drs_shift_key` for why it is a real
+    secret and what its disclosure would cost.
+    """
+    return Path(path).read_bytes()
+
+
+DRS_SHIFT_KEY_ENV = "DATA_COUNTS_DRS_SHIFT_KEY"
+DEFAULT_DRS_SHIFT_KEY = "../central/keys/drs_shift_key.bin"
+
+
+def default_drs_shift_key_path() -> str:
+    """Same relocation story as `default_central_public_key_path`: a source
+    checkout finds `central/` as a sibling, a container mounts the key instead.
+    """
+    return os.environ.get(DRS_SHIFT_KEY_ENV) or DEFAULT_DRS_SHIFT_KEY
+
+
+def run(drs: DataRequestSpecification | None = None, raw_lake_dir: str | Path = "data/lake/raw",
+        work_dir: str | Path = "data/work",
         central_public_key_path: str | Path | None = None,
-        site_keys_dir: str | Path | None = None) -> dict[str, dict[str, str]]:
+        site_keys_dir: str | Path | None = None,
+        drs_shift_key_path: str | Path | None = None) -> dict[str, dict[str, str]]:
     """Single-site tokenization for the main pipeline: identifying attributes
     are read from the *raw* (identifiable) lake layer -- never from the
     de-identified output -- because tokenization must happen before those
     attributes are discarded. The ephemeral (RSA-encrypted) token map is what
     stage 8 packages into the outbound artifact; only the central platform,
     with its own private key, can ever resolve them into linkable tokens.
+
+    When `drs` is given, each token-map entry also carries the site-local
+    `_shift_days` that stage 5 consumes (Req 4), and the output is namespaced
+    under `data/work/<request_id>/`. This stage therefore runs *before* stage 5
+    in the pipeline -- it produces the shift map that de-identification applies.
     """
     raw_dir, work_dir = Path(raw_lake_dir), Path(work_dir)
+    # The site keypair is deliberately NOT namespaced per DRS, unlike the
+    # intermediates below. It is the root of this site's token namespace, and
+    # per-DRS keys would give the same patient a different token in every DRS --
+    # destroying exactly the cross-DRS linkage Req 5 asks for. See
+    # generate_site_keys on why it is long-lived state.
+    out_root = work_dir / drs.request_id if drs is not None else work_dir
     site_priv, _ = generate_site_keys(site_keys_dir or (work_dir / "pprl" / "site"))
     central_pub = load_central_public_key(central_public_key_path or default_central_public_key_path())
+
+    date_shift = drs.deidentification.date_shift if drs is not None else None
+    drs_shift_key = (
+        load_drs_shift_key(drs_shift_key_path or default_drs_shift_key_path())
+        if drs is not None else None
+    )
 
     patient_table = pq.read_table(raw_dir / "Patient.parquet")
     patients = []
@@ -392,9 +525,9 @@ def run(raw_lake_dir: str | Path = "data/lake/raw", work_dir: str | Path = "data
             "birth_date": r.get("birthDate"),
         })
 
-    token_map = tokenize_and_transcrypt(patients, site_priv, central_pub)
+    token_map = tokenize_and_transcrypt(patients, site_priv, central_pub, date_shift, drs_shift_key)
 
-    out_dir = work_dir / "pprl"
+    out_dir = out_root / "pprl"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "tokens_ephemeral.json").write_text(json.dumps(token_map, indent=2))
     return token_map
@@ -411,8 +544,9 @@ def export_site_roster(patients: list[dict], site_dir: str | Path, central_publi
     token_map = tokenize_and_transcrypt(patients, site_priv, central_pub)
 
     out_path = site_dir / "patient.parquet"
-    # Underscore-prefixed keys are site-local (currently `_diff_key`) and must not
-    # cross the boundary -- same exclusion stage8_package.py applies.
+    # Underscore-prefixed keys are site-local (`_diff_key`, and `_shift_days` when
+    # a DRS shift key was supplied) and must not cross the boundary -- same
+    # exclusion stage8_package.py applies.
     rows = [
         {"local_patient_id": pid, **{k: v for k, v in tokens.items() if not k.startswith("_")}}
         for pid, tokens in token_map.items()

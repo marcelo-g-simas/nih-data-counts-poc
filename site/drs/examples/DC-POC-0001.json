@@ -16,7 +16,13 @@
   "extraction_mode": "full",
   "refresh_cadence": "monthly",
   "deidentification": {
-    "date_shift": { "per_patient": true, "max_days": 365, "preserve_order": true }
+    "date_shift": {
+      "per_patient": true,
+      "preserve_order": true,
+      "preserve_seasonality": true,
+      "max_years": 3,
+      "jitter_weeks": 2
+    }
   },
   "checks": [
     { "id": "comp_dob", "kahn_category": "completeness", "target": "patient.birth_date", "type": "completeness", "on_fail": "warn" },

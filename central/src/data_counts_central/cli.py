@@ -17,17 +17,93 @@ _operator = getpass.getuser()
 
 @app.command("setup-keys")
 def setup_keys(keys_dir: str = "keys"):
-    """Generate the central platform's RSA keypair. Run once; hand `central_public_key.pem`
-    to each Healthcare Partner site out-of-band before their first transmission (Req 5).
+    """Provision the central platform's RSA keypair and date-shift secret. Hand
+    `central_public_key.pem` to each Healthcare Partner site out-of-band before their first
+    transmission (Req 5).
+
+    Idempotent: both secrets are load-or-create, so re-running this is safe. Rotating either
+    one invalidates historical packages (see `crypto.generate_central_keys`), so it has to be
+    asked for deliberately rather than being a side effect of running setup twice.
     """
     seclog = SecurityAuditLog()
     seclog.log_event(category="authentication", name="CLI invocation", user=_operator,
                       action="setup-keys", resource="central-cli", outcome="success")
-    priv, pub = crypto.generate_central_keys(keys_dir)
+    crypto.generate_central_keys(keys_dir)
     seclog.log_event(category="configuration_change", name="Central RSA keypair provisioned",
                       user=_operator, action="generate_central_keys", resource=keys_dir, outcome="success")
-    rprint(f"[green]Central keypair generated in {keys_dir}/[/green]")
+    # Load-or-create, so re-running setup-keys does not silently re-shift every
+    # date the platform has ever normalized. See generate_central_shift_secret.
+    crypto.generate_central_shift_secret(keys_dir)
+    seclog.log_event(category="configuration_change", name="Central date-shift secret in use",
+                      user=_operator, action="generate_central_shift_secret", resource=keys_dir,
+                      outcome="success",
+                      message="date-shift secret loaded (generated on first run; independent of the RSA keypair)")
+    rprint(f"[green]Central keypair provisioned in {keys_dir}/[/green]")
     rprint(f"  Public key (share with sites): {Path(keys_dir) / 'central_public_key.pem'}")
+    rprint(f"  Date-shift secret (never shared): {Path(keys_dir) / crypto.SHIFT_SECRET_FILENAME}")
+
+
+@app.command("issue-drs-shift-key")
+def issue_drs_shift_key(request_id: str, keys_dir: str = "keys", out: str | None = None):
+    """Derive the per-DRS date-shift key to hand to every site responding to a DRS. [Req 4]
+
+    Every site responding to `request_id` gets the same key, which is what makes
+    their date offsets agree; the central platform then re-offsets everything onto
+    one global offset per patient at ingest, so offsets agree across DRSs too.
+
+    This is a genuine secret, not a public key: a holder can compute a patient's
+    per-DRS offset and, given a candidate identity, un-shift that DRS's dates.
+    Distribute it out-of-band, per DRS, to responding sites only. The central
+    shift secret it is derived from is never distributed.
+    """
+    seclog = SecurityAuditLog()
+    seclog.log_event(category="authentication", name="CLI invocation", user=_operator,
+                      action="issue-drs-shift-key", resource="central-cli", outcome="success")
+    secret = crypto.generate_central_shift_secret(keys_dir)
+    shift_key = crypto.derive_drs_shift_key(secret, request_id)
+    out_path = Path(out) if out else Path(keys_dir) / "drs_shift_key.bin"
+    out_path.write_bytes(shift_key)
+    out_path.chmod(0o600)
+    seclog.log_event(category="administrative_action", name="Per-DRS date-shift key issued",
+                      user=_operator, action="derive_drs_shift_key", resource=request_id,
+                      outcome="success", message=f"written to {out_path}")
+    rprint(f"[green]Per-DRS shift key for {request_id} written to {out_path}[/green]")
+    rprint("  [yellow]Secret material — distribute out-of-band to responding sites only.[/yellow]")
+
+
+@app.command("reoffset-dates")
+def reoffset_dates(request_id: str, site: str, inbox_dir: str = "inbox", keys_dir: str = "keys",
+                    out_dir: str | None = None, max_years: int = 3, jitter_weeks: int = 2):
+    """Re-offset one site package's dates onto this platform's global offset. [Req 4]
+
+    The site shifted its dates by a per-DRS offset. This applies the delta that
+    carries them to the single global offset for that patient, so the same
+    individual's dates agree across every site and every DRS -- making intervals
+    measured across submissions valid.
+
+    No true calendar date is computed: the two offsets are subtracted from each
+    other, never from the stored date. There is consequently nothing to delete
+    afterward. See `crypto.resolve_and_shift`.
+    """
+    seclog = SecurityAuditLog()
+    seclog.log_event(category="authentication", name="CLI invocation", user=_operator,
+                      action="reoffset-dates", resource="central-cli", outcome="success")
+    secret = crypto.generate_central_shift_secret(keys_dir)
+    central_priv = (Path(keys_dir) / "central_private_key.pem").read_bytes()
+    site_dir = Path(inbox_dir) / site
+    target = Path(out_dir) if out_dir else Path("normalized") / request_id / site
+    counts = ingest.reoffset_domain_tables(
+        site_dir, central_priv, secret, request_id, target, max_years, jitter_weeks,
+    )
+    seclog.log_event(category="administrative_action", name="Date re-offset applied", user=_operator,
+                      action="reoffset_domain_tables", resource=f"{request_id}/{site}",
+                      outcome="success", message=f"domains={sorted(counts)} rows={sum(counts.values())}")
+    if not counts:
+        rprint(f"[yellow]No date-bearing domain tables found under {site_dir}/[/yellow]")
+        return
+    for domain, n in sorted(counts.items()):
+        rprint(f"  [green]✓[/green] {domain}: {n} row(s) re-offset")
+    rprint(f"[bold green]Written to {target}/[/bold green]")
 
 
 @app.command("verify-logs")

@@ -12,7 +12,7 @@ from datetime import date
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class Authorization(BaseModel):
@@ -43,9 +43,44 @@ class DateRange(BaseModel):
 
 
 class DateShift(BaseModel):
+    """Per-patient date-shift parameters. [Req 4]
+
+    `preserve_seasonality` selects the offset *shape*, and it is the parameter
+    that matters analytically. When set (the default), the offset is drawn from a
+    52-week lattice -- `364 * max_years_draw + 7 * jitter_weeks_draw` -- so a
+    shifted date keeps its day of the week exactly and lands within a couple of
+    weeks of its original day of the year. A January admission stays in January,
+    and weekday/weekend utilization patterns survive. `max_days` is then unused:
+    it describes a uniform ±N-day draw, which is precisely the shape that destroys
+    season by moving January into July.
+
+    The jitter is measured in **weeks, not days**, and that is not cosmetic: a
+    day-granular jitter would rotate the day of the week and void the guarantee
+    the 52-week quantum exists to provide. Every term of the offset is a whole
+    number of weeks.
+
+    `max_days` is retained rather than removed so that an existing DRS still
+    validates. It has no effect while `preserve_seasonality` is true.
+    """
+
     per_patient: bool = True
     max_days: int = 365
     preserve_order: bool = True
+    preserve_seasonality: bool = True
+    max_years: int = 3
+    jitter_weeks: int = 2
+
+    @field_validator("jitter_weeks")
+    @classmethod
+    def _jitter_cannot_flip_season(cls, v: int) -> int:
+        # A month is the smallest unit a seasonality claim can survive losing part
+        # of, so the jitter is capped at four weeks. Beyond that the lattice's whole
+        # purpose is defeated, and the caller should say preserve_seasonality=false
+        # rather than configure a season-preserving shift that does not preserve
+        # season.
+        if v < 0 or v > 4:
+            raise ValueError("jitter_weeks must be between 0 and 4 to preserve seasonality")
+        return v
 
 
 class Deidentification(BaseModel):

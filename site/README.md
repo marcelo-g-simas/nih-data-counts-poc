@@ -12,11 +12,13 @@ raw identifiable attribute runs here; `../central/` never sees one.
 
 - **CPU only, no GPU** — nothing in this pipeline (de-id, GLiNER, Presidio) requests a GPU device.
 - **No Spark, no JVM** — pure Python + DuckDB end to end, including PPRL tokenization (see the
-  Stage 6 note below on why that required a documented deviation from a literal reading of the spec).
+  `spindle-token` note below on why that required a documented deviation from a literal reading of
+  the spec).
 - **Deterministic and reproducible** — same input + same DRS ⇒ byte-identical outputs and tokens
   (see `tests/test_reproducibility.py`). Model versions and seeds are pinned and logged.
-- **Source is never modified** — DQ checks (stage 4) report only; de-id (stage 5) writes to
-  `data/work/deid/`, a derived copy. `data/lake/` is read-only after stage 2.
+- **Source is never modified** — DQ checks (stage 4) report only; de-id (stage 6) writes to
+  `data/work/<request_id>/deid/`, a derived copy. `data/lake/` is read-only after stage 2. Work
+  directories are namespaced per DRS, so two DRS runs cannot mix each other's shifted dates.
 - **Single egress path** — the only place this pipeline writes outside `data/` is `outbox/`,
   modeling the RFI's single authorized outbound-to-program step. No other run-time network calls
   occur; models are downloaded once via `make setup`, after which `make demo` runs fully offline.
@@ -38,7 +40,7 @@ make test
 | 1b | `audit.py` | Per-stage provenance/audit record on every batch |
 | 2 | `drs.py`, `stage3_drs.py` | DRS-driven orchestration; flags gaps, never silently substitutes |
 | 3 | `stage4_dq_kahn.py`, halt path in `cli.py` | Kahn-framework DQ checks (conformance/completeness/plausibility); halt on unresolved anomaly |
-| 4 | `stage5_deid.py` | 18 HIPAA identifiers (45 CFR §164.514(b)(2)) removed; per-patient order-preserving date-shift. Not a Safe Harbor claim — see the module docstring and `../REPORT.md` §8 |
+| 4 | `stage5_deid.py` (applies the shift), `stage6_pprl.py` (derives it) | 18 HIPAA identifiers (45 CFR §164.514(b)(2)) removed; per-patient date-shift that is order-preserving, season- and weekday-preserving, and **identical for the same patient at every site** — the offset is keyed on the OPPRL `token1` digest, not on a site-local id. See `../REPORT.md` §5b. Not a Safe Harbor claim — see the module docstring and `../REPORT.md` §8 |
 | 5 | `stage6_pprl.py` (site half: tokenize + transcrypt_out); see `../central/` for the resolution + linkage half | OPPRL v2 tokenization (token1/2/3), DuckDB-native |
 | 6 | `stage2_ingest.py` (2a/2b), `fhir_views/*.json`, `viewdef.py` | Lossless, round-trippable raw Parquet layer + traceable flat analytic views |
 | 8 | `stage8_package.py` | Versioned package, idempotent reruns, added/updated/deleted tracking |
@@ -196,8 +198,8 @@ For air-gapped sites, `make image-save` writes an OCI archive that either engine
 `FROM` lines by digest before shipping for real — the Containerfile notes where — so rebuilds are
 byte-identical.
 
-**No key material is baked into the image.** Stage 6 needs exactly one input from outside this
-project: the *program's* RSA public key, which it encrypts site tokens under. In a source checkout
+**No key material is baked into the image.** The tokenization stage needs exactly one input from
+outside this project: the *program's* RSA public key, which it encrypts site tokens under. In a source checkout
 that resolves as a sibling path (`../central/keys/`); inside the image nothing above `/app` exists,
 so `image-run` mounts it read-only at `/app/keys/` and points `DATA_COUNTS_CENTRAL_PUBLIC_KEY` at it.
 Override the host path with `make CENTRAL_PUBLIC_KEY=/path/to/key.pem image-run`. This is also the

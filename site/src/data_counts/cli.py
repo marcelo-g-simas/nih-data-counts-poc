@@ -220,15 +220,14 @@ def run_all(drs: str = "drs/examples/DC-POC-0001.json", population: int = 1000):
                               message="on_fail=halt check failed; transmission blocked")
             raise PipelineHalt(f"DQ check(s) failed with on_fail=halt: {s4}")
 
-        rprint("[bold cyan]Stage 5/9 — De-identification[/bold cyan] [dim](Req 4)[/dim]")
-        s5 = stage5_deid.run(s3["drs"])
-        audit_log.record(stage_id="stage5_deid", batch_id=s3["drs"].request_id, record_counts=s5,
-                          outcome="ok", reconciliation_status="ok")
-        rprint(f"  [green]✓[/green] 18 HIPAA identifiers removed; per-patient date-shift applied across {len(s5)} domains "
-               f"({sum(s5.values())} rows)")
-
-        rprint("[bold cyan]Stage 6/9 — OPPRL tokenization[/bold cyan] [dim](Req 5, site half only — tokenize + transcrypt_out)[/dim]")
-        tokens = stage6_pprl.run()
+        # Tokenization runs BEFORE de-identification, and not only because it needs
+        # the raw identifiers that de-identification discards. It also derives each
+        # patient's date offset from the OPPRL token1 digest -- the one per-identity
+        # value that is the same at every site -- and stage 5 consumes that offset.
+        # Deriving the offset from a site-local patient id instead, as stage 5 used
+        # to, shifted the same patient differently at every site (Req 4).
+        rprint("[bold cyan]Stage 5/9 — OPPRL tokenization[/bold cyan] [dim](Req 5, site half only — tokenize + transcrypt_out)[/dim]")
+        tokens = stage6_pprl.run(s3["drs"])
         audit_log.record(
             stage_id="stage6_pprl", batch_id=s3["drs"].request_id, record_counts={"patients_tokenized": len(tokens)},
             outcome="ok", reconciliation_status="ok",
@@ -240,6 +239,19 @@ def run_all(drs: str = "drs/examples/DC-POC-0001.json", population: int = 1000):
         )
         rprint(f"  [green]✓[/green] {len(tokens)} patients tokenized (token1/2/3), encrypted under the central platform's public key")
         rprint("  [dim]→ this site cannot decrypt what it just produced — only the central platform's private key can[/dim]")
+
+        rprint("[bold cyan]Stage 6/9 — De-identification[/bold cyan] [dim](Req 4)[/dim]")
+        shift_map = stage5_deid.shift_map_from_token_map(tokens)
+        s5 = stage5_deid.run(s3["drs"], shift_map)
+        audit_log.record(stage_id="stage5_deid", batch_id=s3["drs"].request_id, record_counts=s5,
+                          outcome="ok", reconciliation_status="ok")
+        domain_counts = {k: v for k, v in s5.items() if not k.startswith("_")}
+        rprint(f"  [green]✓[/green] 18 HIPAA identifiers removed; per-patient date-shift applied across "
+               f"{len(domain_counts)} domains ({sum(domain_counts.values())} rows)")
+        rprint("  [dim]→ shift is season- and weekday-preserving, and identical for this patient at every site[/dim]")
+        if s5["_excluded_unshiftable"]:
+            rprint(f"  [yellow]{s5['_excluded_unshiftable']} row(s) excluded: no derivable offset "
+                   f"(incomplete identity attributes, so no token1)[/yellow]")
 
         rprint("[bold cyan]Stage 7/9 — Residual PII-leakage gate[/bold cyan] [dim](Req 3 halt-on-anomaly, 9, 13)[/dim]")
         # This synthetic cohort carries no free-text clinical notes, so the real outbound
@@ -281,7 +293,7 @@ def run_all(drs: str = "drs/examples/DC-POC-0001.json", population: int = 1000):
             rprint("  [yellow]⚠ injected-leak demo did not trigger a halt -- detectors may be unavailable (run `make setup`).[/yellow]")
 
         rprint("[bold cyan]Stage 8/9 — Package + transmit[/bold cyan] [dim](Req 8, 15)[/dim]")
-        s8 = stage8_package.run("data/work/deid", tokens, s3["drs"].request_id)
+        s8 = stage8_package.run(f"data/work/{s3['drs'].request_id}/deid", tokens, s3["drs"].request_id)
         audit_log.record(stage_id="stage8_package", batch_id=s8["snapshot_id"], record_counts=s8["tables"],
                           outcome="ok", reconciliation_status="ok")
         rprint(f"  [dim]snapshot:[/dim] {s8['snapshot_id']}  [dim]refresh:[/dim] {s8['refresh_id']}")
