@@ -173,6 +173,24 @@ async def test_run_panel_reflects_audit_log_entries(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_panel_orders_most_recent_first(tmp_path):
+    work_dir = tmp_path / "work"
+    log = AuditLog(work_dir)
+    log.record(stage_id="stage1_synthea", batch_id="cohort",
+               record_counts={"Patient": 5}, outcome="ok", reconciliation_status="n/a")
+    log.record(stage_id="stage2_ingest", batch_id="cohort",
+               record_counts={"Patient": 5}, outcome="ok", reconciliation_status="n/a")
+
+    app = tui.OpsConsoleApp(work_dir=work_dir, review_queue_dir=tmp_path / "rq",
+                             outbox_dir=tmp_path / "outbox", refresh_interval=0)
+    async with app.run_test() as _pilot:
+        table = app.query_one(tui.RunPanel).query_one("#run-table")
+        rows = [table.get_row_at(i) for i in range(table.row_count)]
+        # stage_id is column index 1; most recently recorded stage must appear first.
+        assert [row[1] for row in rows] == ["stage2_ingest", "stage1_synthea"]
+
+
+@pytest.mark.asyncio
 async def test_outbox_panel_shows_manifest_diff(tmp_path):
     outbox_dir = tmp_path / "outbox"
     snapshot_dir = outbox_dir / "DC-POC-0001" / "abc123"

@@ -136,7 +136,7 @@ class RunPanel(Vertical):
         entries = read_audit_log(self.work_dir)
         table = self.query_one("#run-table", DataTable)
         table.clear()
-        for entry in entries:
+        for entry in reversed(entries):
             counts = entry.get("record_counts") or {}
             counts_str = ", ".join(f"{k}={v}" for k, v in list(counts.items())[:4])
             outcome = entry.get("outcome", "")
