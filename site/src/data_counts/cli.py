@@ -7,10 +7,12 @@ from __future__ import annotations
 import getpass
 import json
 import random
+import tempfile
 from pathlib import Path
 
 import typer
 from rich import print as rprint
+from rich.table import Table
 
 from . import (
     stage1_synthea,
@@ -159,6 +161,8 @@ def export_linkage_demo_sites(
     scale: int = 1,
     n_sites: int = 2,
     seed: int = 42,
+    central_url: str | None = None,
+    request_id: str = "linkage-demo",
 ):
     """Simulate independently-keyed Healthcare Partner sites and export them
     to the central platform's inbox, to demonstrate noisy-identifier linkage
@@ -191,6 +195,14 @@ def export_linkage_demo_sites(
     patient is which real identity) used purely to score the linkage results
     afterward -- central never sees this file; it plays no role in the actual
     privacy-preserving pipeline.
+
+    `central_url`, if given (e.g. `http://127.0.0.1:8001`), sends each site's
+    exported `patient.parquet` to the central Program API's `POST
+    /sites/{site}/packages` (Req 15) over HTTP -- with exponential-backoff
+    retries via `central_client.py` -- instead of writing straight into
+    `inbox_dir`. `inbox_dir` is then unused; `request_id` names the DRS these
+    packages respond to (also needed by `fetch-linkage-result` afterward).
+    Default (`central_url=None`) is unchanged: the original direct file-drop.
     """
     if scale == 1 and n_sites == 2:
         exact = {"first_name": "Jane", "last_name": "Doe", "gender": "F", "birth_date": "1980-05-12"}
@@ -222,17 +234,79 @@ def export_linkage_demo_sites(
     else:
         site_rows, ground_truth = _build_scaled_scenario(scale, n_sites, seed)
 
-    for site_name, rows in site_rows.items():
-        path = stage6_pprl.export_site_roster(rows, f"{inbox_dir}/{site_name}", central_public_key_path)
-        rprint(f"[green]Exported {site_name} ({len(rows)} patients) -> {path}[/green]")
+    seclog = SecurityAuditLog()
+    if central_url:
+        from . import central_client
+        rprint(f"[bold cyan]Transmitting via central Program API at {central_url} "
+               f"(request_id={request_id!r})...[/bold cyan]")
+        central_client.wait_until_reachable(central_url)
+        with tempfile.TemporaryDirectory(prefix="data-counts-export-") as tmp:
+            for site_name, rows in site_rows.items():
+                path = stage6_pprl.export_site_roster(rows, Path(tmp) / site_name, central_public_key_path)
+                result = central_client.upload_package(central_url, request_id, site_name, path)
+                rprint(f"[green]Uploaded {site_name} ({len(rows)} patients, "
+                       f"{result['rows_resolved']} row(s) resolved) -> {central_url}"
+                       f"/sites/{site_name}/packages?request_id={request_id}[/green]")
+        seclog.log_event(category="administrative_action", name="Linkage demo export", user=_operator,
+                          action="export-linkage-demo-sites", resource=f"{central_url}/{request_id}",
+                          outcome="success", message=f"sites={sorted(site_rows)} via=api")
+    else:
+        for site_name, rows in site_rows.items():
+            path = stage6_pprl.export_site_roster(rows, f"{inbox_dir}/{site_name}", central_public_key_path)
+            rprint(f"[green]Exported {site_name} ({len(rows)} patients) -> {path}[/green]")
+        seclog.log_event(category="administrative_action", name="Linkage demo export", user=_operator,
+                          action="export-linkage-demo-sites", resource=inbox_dir,
+                          outcome="success", message=f"sites={sorted(site_rows)} via=file-drop")
 
     Path(ground_truth_path).write_text(json.dumps(ground_truth, indent=2))
     rprint(f"[green]Ground truth (demo-only) -> {ground_truth_path}[/green]")
-    rprint("Run `cd ../central && uv run data-counts-central link --ground-truth ../linkage_ground_truth.json`.")
+    if central_url:
+        rprint(f"Run `data-counts fetch-linkage-result --central-url {central_url} "
+               f"--request-id {request_id}`.")
+    else:
+        rprint("Run `cd ../central && uv run data-counts-central link --ground-truth ../linkage_ground_truth.json`.")
 
-    seclog = SecurityAuditLog()
-    seclog.log_event(category="administrative_action", name="Linkage demo export", user=_operator,
-                      action="export-linkage-demo-sites", resource=inbox_dir, outcome="success")
+
+@app.command("fetch-linkage-result")
+def fetch_linkage_result(
+    request_id: str = "linkage-demo",
+    central_url: str = "http://127.0.0.1:8001",
+    ground_truth: str | None = None,
+):
+    """Query the central Program API for a DRS's cross-site linkage result
+    over HTTP (Req 5, Req 15) -- the API-based counterpart of `central`'s
+    `link` CLI command, for use after `export-linkage-demo-sites
+    --central-url ...` has uploaded packages via the API rather than
+    file-dropping into `inbox/`.
+
+    `ground_truth`, if given, must be a path the *central* process can read
+    (its own filesystem, e.g. inside its container -- not this site process's
+    filesystem), matching `GET /drs/{request_id}/linkage?ground_truth=...`.
+    Retries with exponential backoff, same as the upload step.
+    """
+    from . import central_client
+
+    rprint(f"[bold cyan]Querying {central_url}/drs/{request_id}/linkage ...[/bold cyan]")
+    result = central_client.get_linkage(central_url, request_id, ground_truth=ground_truth)
+
+    table = Table(title="Linkage clusters (via Program API)")
+    table.add_column("cluster_id")
+    table.add_column("size")
+    table.add_column("sites")
+    for cluster in result["clusters"]:
+        table.add_row(cluster["cluster_id"], str(cluster["size"]), ", ".join(cluster["sites"]))
+    rprint(table)
+
+    cross_site = sum(1 for c in result["clusters"] if len(c["sites"]) > 1)
+    rprint(f"[bold green]{cross_site} identity(ies) linked across sites.[/bold green]")
+
+    if "evaluation" in result:
+        ev = result["evaluation"]
+        rprint("\n[bold cyan]Linkage evaluation (synthetic-demo-only ground truth)[/bold cyan]")
+        rprint(f"  precision: {ev['precision']:.3f}   recall: {ev['recall']:.3f}   F1: {ev['f1']:.3f}")
+        rprint(f"  true positive pairs:  {ev['true_positive_pairs']}")
+        rprint(f"  false positive pairs: {ev['false_positive_pairs']}")
+        rprint(f"  false negative pairs: {ev['false_negative_pairs']}")
 
 
 @app.command("tui")
@@ -268,7 +342,20 @@ def verify_logs(work_dir: str = "data/work"):
 
 
 @app.command("run-all")
-def run_all(drs: str = "drs/examples/DC-POC-0001.json", population: int = 1000):
+def run_all(drs: str = "drs/examples/DC-POC-0001.json", population: int = 1000,
+            central_url: str | None = None, site_name: str = "site_a",
+            outbox_dir: str = "outbox"):
+    """Run the full 9-stage leave-behind pipeline. [Req 1-15]
+
+    Stage 8 always packages to `outbox_dir` (Req 8) -- that write never
+    depends on `central_url`. When `central_url` is given (e.g.
+    `http://127.0.0.1:8001`), stage 8 *additionally* transmits the packaged
+    tables to the central Program API's `POST /sites/{site_name}/packages`
+    (Req 15) over HTTP, with exponential-backoff retries (`central_client.py`
+    -- same client `export-linkage-demo-sites --central-url` and
+    `fetch-linkage-result` use). Without it, transmission is exactly what it
+    always was: a file sitting in `outbox/` for a separate step to pick up.
+    """
     audit_log = AuditLog()
     seclog = SecurityAuditLog()
     seclog.log_event(category="authentication", name="CLI invocation", user=_operator,
@@ -403,7 +490,8 @@ def run_all(drs: str = "drs/examples/DC-POC-0001.json", population: int = 1000):
             rprint("  [yellow]⚠ injected-leak demo did not trigger a halt -- detectors may be unavailable (run `make setup`).[/yellow]")
 
         rprint("[bold cyan]Stage 8/9 — Package + transmit[/bold cyan] [dim](Req 8, 15)[/dim]")
-        s8 = stage8_package.run(f"data/work/{s3['drs'].request_id}/deid", tokens, s3["drs"].request_id)
+        s8 = stage8_package.run(f"data/work/{s3['drs'].request_id}/deid", tokens, s3["drs"].request_id,
+                                 outbox_dir=outbox_dir)
         audit_log.record(stage_id="stage8_package", batch_id=s8["snapshot_id"], record_counts=s8["tables"],
                           outcome="ok", reconciliation_status="ok")
         rprint(f"  [dim]snapshot:[/dim] {s8['snapshot_id']}  [dim]refresh:[/dim] {s8['refresh_id']}")
@@ -411,6 +499,26 @@ def run_all(drs: str = "drs/examples/DC-POC-0001.json", population: int = 1000):
             rprint(f"  [dim]•[/dim] {table_name}: {info['row_count']} rows")
         rprint(f"  [green]✓[/green] +{len(s8['diff']['added'])} added / {len(s8['diff']['updated'])} updated / "
                f"{len(s8['diff']['deleted'])} deleted since last refresh")
+
+        if central_url:
+            from . import central_client
+            snapshot_dir = Path(outbox_dir) / s3["drs"].request_id / s8["snapshot_id"]
+            package_files = [snapshot_dir / f"{name}.parquet" for name in s8["tables"]]
+            rprint(f"  [bold cyan]Transmitting to central Program API at {central_url}...[/bold cyan]")
+            central_client.wait_until_reachable(central_url)
+            transmit_result = central_client.upload_package_files(
+                central_url, s3["drs"].request_id, site_name, package_files,
+            )
+            rprint(f"  [green]✓[/green] {transmit_result['rows_resolved']} row(s) resolved by central "
+                   f"({', '.join(transmit_result['files_received'])})")
+            seclog.log_event(category="administrative_action", name="Outbox package transmitted", user=_operator,
+                              action="upload_package_files", resource=f"{central_url}/{s3['drs'].request_id}",
+                              outcome="success",
+                              message=f"site={site_name} files={sorted(f.name for f in package_files)}")
+        else:
+            seclog.log_event(category="administrative_action", name="Outbox package written", user=_operator,
+                              action="stage8_package.run", resource=str(Path(outbox_dir) / s3["drs"].request_id),
+                              outcome="success", message="not transmitted (no --central-url given)")
 
         rprint("[bold cyan]Stage 9/9 — Audit + QA manifest + RFI summary[/bold cyan] [dim](Req 1b, 9, 11)[/dim]")
         record_counts = {**s1["counts"], **s2["raw"]}

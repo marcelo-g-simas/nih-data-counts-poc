@@ -25,6 +25,7 @@ dependencies = [
     "rich==13.9.4",
     "en-core-web-sm",
     "textual==6.2.1",
+    "httpx==0.27.2",  # central_client.py -- optional API-transmission path for export-linkage-demo-sites/fetch-linkage-result
 ]
 
 [project.optional-dependencies]

@@ -34,15 +34,54 @@ it is given.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import getpass
+import logging
 import math
 import os
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 
 from . import evaluation, ingest, linkage
 from .security_audit import SecurityAuditLog
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("data_counts_central.api")
+
+# So a demo has something to watch: a periodic "still alive" line even with no
+# traffic, on top of the per-request access log the middleware below writes.
+# Purely observational -- carries no state the pipeline depends on, unlike the
+# hash-chained SecurityAuditLog every route also writes to (Req 11).
+_HEARTBEAT_INTERVAL_S = float(os.environ.get("DATA_COUNTS_CENTRAL_HEARTBEAT_INTERVAL", "15"))
+_request_count = 0
+_started_at = time.monotonic()
+
+
+async def _heartbeat_loop(interval: float) -> None:
+    while True:
+        await asyncio.sleep(interval)
+        logger.info("heartbeat: alive %.0fs, %d request(s) served",
+                    time.monotonic() - _started_at, _request_count)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    logger.info("Data COUNTS central Program API ready (Req 15) -- "
+                "no TLS/auth middleware, architecture-only for this POC (Req 12).")
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(_HEARTBEAT_INTERVAL_S))
+    try:
+        yield
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+        logger.info("Data COUNTS central Program API shutting down "
+                     "(%d request(s) served)", _request_count)
+
 
 app = FastAPI(
     title="Data COUNTS Central Program API",
@@ -50,7 +89,25 @@ app = FastAPI(
         "Ingest + status + linkage-read surface for the central platform. "
         "No TLS/auth middleware -- architecture-only, see module docstring."
     ),
+    lifespan=_lifespan,
 )
+
+
+@app.middleware("http")
+async def _access_log(request: Request, call_next):
+    """Per-request access log line, independent of uvicorn's own access log
+    and of the hash-chained SecurityAuditLog each route writes to -- this one
+    is plain stdout, so `podman logs -f` shows activity as it happens.
+    """
+    global _request_count
+    _request_count += 1
+    request_num = _request_count
+    start = time.monotonic()
+    response = await call_next(request)
+    duration_ms = (time.monotonic() - start) * 1000
+    logger.info("#%d %s %s -> %s (%.1fms)",
+                request_num, request.method, request.url.path, response.status_code, duration_ms)
+    return response
 
 # Overridable via env var (matches the CLI's own `--inbox-dir`/`--keys-dir`
 # options) rather than hardcoded, and read fresh on every request rather than
@@ -111,6 +168,14 @@ async def upload_site_package(
     the package by resolving it immediately (`ingest.resolve_site_package`),
     so a malformed upload fails at submission time rather than at the next
     linkage run.
+
+    NOT SCALE-TESTED (Req 15) -- each file below is read fully into memory
+    via `upload.read()` rather than streamed to disk, and the caller
+    (`central_client.py`) applies a flat 30s timeout covering both transfer
+    and this route's synchronous per-row transcryption. Fine at this POC's
+    demo scale; a real deployment needs the resumable chunked upload Req 15
+    already names as a remaining gap before larger packages go through this
+    route. See `REQUIREMENTS.md` Req 15.
     """
     seclog = _seclog()
     _log_request(seclog, "upload_site_package", f"{request_id}/{site_name}")

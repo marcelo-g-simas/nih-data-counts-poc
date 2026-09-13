@@ -1,0 +1,55 @@
+# OCI image for the central platform's Program API (Req 15).
+#
+# Named Containerfile (podman/buildah's default) for the same reason as
+# site/Containerfile: podman is daemonless and rootless, so operating this
+# container needs no root-owned socket. Plain Dockerfile syntax -- no
+# BuildKit-only directives -- so `make ENGINE=docker image-build` also works.
+#
+# Unlike site's image (an offline batch job with no listening socket, by
+# design -- see Req 12a), this one *is* a listener: it serves the FastAPI
+# Program API on a TCP port. That is the deliberate scope line drawn in
+# api.py's module docstring -- no TLS, no auth middleware, `architecture-only`
+# for this POC. Don't mistake this image for a production-ready deployment
+# unit; it exists to make Req 15's API demoable, not to be internet-facing.
+FROM python:3.11-slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1
+
+COPY --from=ghcr.io/astral-sh/uv:0.10.2 /uv /uvx /usr/local/bin/
+
+WORKDIR /app
+
+# Dependency layer first, so editing source doesn't invalidate the slower
+# dependency-resolution layer (splink's DuckDB backend, fastapi/uvicorn, etc).
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project
+
+COPY . .
+RUN uv sync --frozen
+
+RUN find /app/.venv/lib -type d \( -iname 'tests' -o -iname 'test' \) -prune -exec rm -rf {} +
+
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim AS runtime
+
+RUN useradd --create-home --uid 1000 datacounts
+
+WORKDIR /app
+COPY --from=builder --chown=datacounts:datacounts /app /app
+
+ENV PATH="/app/.venv/bin:${PATH}" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# inbox/ receives uploaded site packages (POST /sites/{site}/packages);
+# keys/ holds the platform's RSA keypair + date-shift secret, mounted from
+# the host so key material is never baked into the image (see
+# `make setup-keys` and site/Containerfile's identical stance on this).
+RUN mkdir -p inbox keys && chown -R datacounts:datacounts inbox keys
+VOLUME ["/app/inbox", "/app/keys"]
+
+USER datacounts
+EXPOSE 8001
+
+ENTRYPOINT ["data-counts-central"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "8001"]
