@@ -297,6 +297,121 @@ Two further limitations, both recorded in `REQUIREMENTS.md`:
   crosses a trust boundary, and Req 5's "no shared trust boundary" language should be read with it
   in view. `central_shift_secret` is never distributed.
 
+## 5c. Scaling up: linkage and DQ evidence at larger cohort sizes
+
+Everything above ran on a 100-patient main-pipeline cohort and the hand-picked 5-identity,
+2-site linkage toy from §5.3. That is enough to demonstrate the mechanisms, but not enough to
+say whether the measured numbers are an artifact of a small, hand-picked example or hold at a
+more realistic scale. `scripts/render_charts.py` (`make report-charts`) answers that by
+re-running the same `data-counts`/`data-counts-central` CLIs this report has been describing —
+no new business logic — at larger sizes, and rendering the results. Every number below is from
+an actual run captured in `assets/render_charts_summary.json`, not estimated.
+
+### 5c.1 Does precision/recall/F1 hold up as the linkage scenario grows?
+
+`export-linkage-demo-sites` (`site/`) now takes `--scale`/`--n-sites` on top of its original
+default (`scale=1, n_sites=2`, which reproduces §5.3's exact 5-identity/2-site scenario
+byte-for-byte — nothing about the default demo changed). Larger values generate more
+identity-groups, cycling through the same four cases (exact / noisy-typo / twins / site-only),
+spread across more independently-keyed sites:
+
+![Precision, recall and F1 across three linkage scenario sizes](assets/linkage_metrics_vs_scale.svg)
+
+| Scenario | Records | Sites | Precision | Recall | F1 | Clusters |
+|---|---|---|---|---|---|---|
+| baseline (§5.3's scenario) | 8 | 2 | 0.667 | 1.000 | 0.800 | 5 |
+| 10x identities | 18 | 4 | 0.750 | 1.000 | 0.857 | 10 |
+| 40x identities | 70 | 6 | 0.667 | 0.900 | 0.766 | 43 |
+
+**Reading this honestly: precision does not degrade monotonically, and it doesn't stay pinned at
+the baseline's 0.667 either.** At 18 records precision actually improved to 0.75 — this
+scenario's false positives come from coincidental token collisions between genuinely different
+people (the twins case, by design, plus any other pair that happens to share soundex+metaphone+
+birth-date at random), and at small N there just aren't many chances for that to happen beyond
+the deliberately-planted twins pair. At 70 records it happens more: the false positives at that
+scale include several *site-only* identities that were supposed to never link at all (e.g.
+`a-11`/`f-10`, `c-3`/`d-2`) — different, unrelated synthetic people whose randomly-drawn
+first/last names, gender, and birth date happened to collide on every token this system computes.
+That is the twins problem generalized: **it is not a special case of "twins," it is a property of
+a 3-token, phonetic-plus-exact-birth-date scheme at any scale** — the more records, the more
+chances for an unrelated pair to land on the same token1/2/3 triple. Recall also dipped slightly
+at the largest scale (0.900, two false negatives) — inspecting the run's own vowel-substitution
+typo generator (`_scale_typo` in `cli.py`) shows this is a real instance of §5.1's noise-tolerance
+boundary, not a fluke: a handful of the randomly generated last-name typos happened to change the
+first letter of the name (e.g. a name beginning with a vowel), which *does* shift Soundex's code
+(Soundex keeps the first letter verbatim), unlike the interior-vowel substitutions that motivated
+`_scale_typo`'s design. Both findings sharpen, rather than soften, §5.5's honest-limitation
+framing: a coarse token scheme's precision is scale-sensitive in the direction you'd expect
+(more records, more accidental collisions), and its recall is only as robust as the noise model
+actually reflects real-world typos.
+
+### 5c.2 Cluster-size distribution at the larger scale
+
+The 70-record/6-site run resolves into 43 clusters — 27 of size 2 (a match found, whether a true
+or false one) and 16 of size 1 (correctly or incorrectly left unlinked):
+
+![Cluster-size distribution from the 70-record, 6-site linkage run](assets/cluster_size_distribution.svg)
+
+No cluster larger than 2 appears, which is expected: this scenario never plants a 3+-way match
+(every identity-group is at most a pair across sites), so a cluster of size 3+ would itself be a
+finding worth investigating rather than an artifact of scale.
+
+### 5c.3 DQ anomaly rate by check, at 100 / 1,000 / 10,000 patients
+
+Re-running `run-all` (the main 9-stage pipeline, not the linkage demo) at 100, 1,000, and 10,000
+synthetic patients and inspecting `data/work/dq_anomaly_report.json` after each run:
+
+![DQ anomaly status per Kahn check, at three cohort sizes](assets/dq_anomaly_by_check.svg)
+
+All five checks pass — zero anomalies — at every scale tested. Stated plainly, **that is an
+expected property of this pure-Python synthetic generator, not a validated claim about how these
+checks behave on real EHR data**: `stage1_synthea.py`'s fallback path always emits complete
+`birth_date`s, unique patient ids, well-typed observation values, and non-inverted encounter
+periods by construction. What this run *does* establish is that the checks themselves execute
+correctly and cheaply at two orders of magnitude more volume (10,000 patients, 71k+ resources,
+in about 20 seconds on this machine) — a scale argument, not a data-quality argument. Exercising
+the halt-on-anomaly path (§7 elsewhere in this repo's write-ups) still requires a deliberately
+malformed fixture, which is the point: this cohort is clean by design, so it should never fire
+one on its own.
+
+### 5c.4 Distribution of realized date-shift offsets
+
+§5b.4 states the per-patient lattice supports at most 7 × 5 = 35 distinct offsets from the true
+date, and separately reports "113 distinct deltas on the 1000-patient demo" for a different,
+narrower quantity — the *delta* `shift_global − shift_drs` a re-offset computes when
+reconciling two DRSs, which needs a second DRS registration to produce and isn't what this script
+re-runs. What this script *can* cheaply re-measure at scale is the more fundamental quantity that
+35-value bound is actually about: the realized `shift_days` lattice value stage 6 derives per
+patient for a single DRS. At every population tested (100 / 1,000 / 10,000 patients) this run hit
+**exactly 35 distinct values**, ranging from −1,106 to +1,106 days — precisely `364·3 + 7·2`,
+confirming the lattice's stated bounds against real output rather than by construction alone:
+
+![Distribution of realized per-patient date-shift lattice values, 10,000-patient run](assets/date_shift_lattice_distribution.svg)
+
+The distribution across the 35 values is close to uniform (10,000 patients / 35 values ≈ 286 per
+value on average), which is expected: `derive_shift_days` draws from a keyed hash of each
+patient's token1 digest, so the offsets it produces should be roughly evenly spread regardless of
+cohort size. This corroborates §5b.4's "35 is the honest number" claim with an actual measurement. It is
+deliberately **not** presented as the histogram behind that section's "113 distinct deltas"
+figure: that number is a count of cross-DRS *deltas*, which requires actually running the
+cross-DRS reoffset path (`central reoffset-dates`) end to end against a second DRS registration —
+a heavier, `central/`-internal flow out of scope for this change. What's shown here is the more
+fundamental quantity that delta is computed from, honestly labeled as such rather than mislabeled
+to match a number this script didn't reproduce.
+
+### 5c.5 Reproducing this section
+
+```
+$ make report-charts
+```
+
+runs everything above from the existing CLIs (`data-counts run-all`, `data-counts
+export-linkage-demo-sites --scale --n-sites`, `data-counts-central link`) into temporary
+directories (the linkage scale-out never touches the shared `central/inbox`/
+`linkage_ground_truth.json` that plain `make linkage-demo` uses), renders the four SVGs under
+`assets/`, and writes `assets/render_charts_summary.json` with every number above, so a future
+run's numbers can be diffed against this section rather than taken on faith.
+
 ## 6. Tamper-evident audit logging (Req 11)
 
 The RFI asks for two different things that are easy to conflate: Req 9's *processing* audit trail

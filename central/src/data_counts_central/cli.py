@@ -174,5 +174,25 @@ def link(inbox_dir: str = "inbox", keys_dir: str = "keys", ground_truth: str | N
         rprint(f"  false negatives: {metrics['false_negative_pairs']}")
 
 
+@app.command("serve")
+def serve(host: str = "127.0.0.1", port: int = 8001, reload: bool = False):
+    """Launch the FastAPI Program API (Req 15). [Req 15]
+
+    Wraps `ingest`/`linkage`/`evaluation`/audit-log verification behind HTTP
+    routes -- see `api.py`'s module docstring for the endpoints and for why
+    this deliberately ships with no TLS/auth middleware (`architecture-only`,
+    consistent with Req 12). Not a production entrypoint: no TLS termination,
+    no process manager, no auth -- a POC demo server only.
+    """
+    import uvicorn
+
+    seclog = SecurityAuditLog()
+    seclog.log_event(category="authentication", name="CLI invocation", user=_operator,
+                      action="serve", resource="central-cli", outcome="success")
+    rprint(f"[bold cyan]Data COUNTS central Program API[/bold cyan] on http://{host}:{port}")
+    rprint("  [yellow]No TLS/auth middleware -- architecture-only for this POC (Req 12, Req 15).[/yellow]")
+    uvicorn.run("data_counts_central.api:app", host=host, port=port, reload=reload)
+
+
 if __name__ == "__main__":
     app()

@@ -43,9 +43,24 @@ make setup          # installs both projects' deps; downloads/exports site's mod
 make demo           # runs the main pipeline (site/) end to end
 make linkage-demo   # Req 5 evidence: cross-site linkage + precision/recall/F1
 make verify-logs    # Req 11: confirm both projects' hash-chained logs are untampered
+make report-charts  # REPORT.md §5c evidence: linkage/DQ/date-shift charts at larger scale
 make test           # both projects' test suites
 ```
 
 See `REQUIREMENTS.md` for the full RFI-requirement-to-module map (and `site/README.md` for the
 site-project subset of it), and `central/README.md` for why Splink is the right tool for turning
 OPPRL's binary tokens into graded match confidence.
+
+## Beyond the pipeline: an API and an operator console
+
+Two more entry points sit on top of the same pipeline code, for anyone who wants to interact
+with the system rather than just read its output:
+
+- `cd central && data-counts-central serve` — the Program API (Req 15) as a real, running
+  HTTP listener: package upload, per-DRS status, linkage results, and audit-log verification.
+  See `central/src/data_counts_central/api.py`'s module docstring for what's implemented versus
+  `architecture-only` (no TLS/auth middleware — that's a deployment concern, not this POC's).
+- `cd site && data-counts tui` — a [Textual](https://textual.textualize.io/) console over a
+  running or completed pipeline: live stage status, DQ results, leak-gate review-queue triage,
+  outbox contents, and audit-log tamper verification, all reading the same files `make demo`
+  already produces. See `site/src/data_counts/tui.py`.

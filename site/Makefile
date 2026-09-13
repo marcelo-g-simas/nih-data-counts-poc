@@ -1,4 +1,4 @@
-.PHONY: setup gen-data demo verify-logs test clean lint image-build image-run image-save
+.PHONY: setup gen-data demo verify-logs tui test clean lint image-build image-run image-save
 
 DRS ?= drs/examples/DC-POC-0001.json
 IMAGE ?= data-counts-poc:latest
@@ -26,6 +26,12 @@ demo:
 
 verify-logs:
 	uv run data-counts verify-logs
+
+# Live ops console (Textual) over data/work, data/review_queue, outbox/ --
+# read-only, demo aid only. Run alongside `make demo` in another terminal
+# to watch the run view update as stages complete.
+tui:
+	uv run data-counts tui
 
 test:
 	uv run pytest -q

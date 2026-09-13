@@ -1,4 +1,4 @@
-.PHONY: setup demo linkage-demo verify-logs test clean
+.PHONY: setup demo linkage-demo verify-logs report-charts test clean
 
 # One-time setup for both projects: installs deps, downloads/exports models
 # (site), and generates the central platform's RSA keypair (central).
@@ -24,6 +24,16 @@ linkage-demo:
 verify-logs:
 	cd site && $(MAKE) verify-logs
 	cd central && $(MAKE) verify-logs
+
+# REPORT.md §5c evidence: re-runs the main pipeline at 100/1,000/10,000
+# patients and the linkage demo at several identity/site scales (all via the
+# existing `data-counts`/`data-counts-central` CLIs, never new business
+# logic), then renders the results as SVG charts under assets/. Needs both
+# projects' `uv` environments set up (`make setup`) and central's RSA
+# keypair provisioned; nothing else. Real numbers only -- see
+# scripts/render_charts.py's docstring.
+report-charts:
+	python3 scripts/render_charts.py
 
 test:
 	cd site && $(MAKE) test

@@ -1,4 +1,4 @@
-.PHONY: setup link verify-logs test lint clean
+.PHONY: setup link serve verify-logs test lint clean
 
 setup:
 	uv sync --all-extras
@@ -7,6 +7,9 @@ setup:
 
 link:
 	uv run data-counts-central link
+
+serve:
+	uv run data-counts-central serve
 
 verify-logs:
 	uv run data-counts-central verify-logs

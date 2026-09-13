@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import random
 from pathlib import Path
 
 import typer
@@ -72,16 +73,101 @@ def cli_stage2(ndjson_dir: str = "data/synthea_ndjson", lake_dir: str = "data/la
     rprint(result)
 
 
+_SCALE_FIRST_NAMES = [
+    "Jane", "John", "Alice", "Bob", "Carol", "Dave", "Erin", "Frank", "Grace", "Henry",
+    "Ivy", "Jack", "Karen", "Leo", "Mona", "Nate", "Olive", "Pete", "Quinn", "Ruth",
+    "Sam", "Tara", "Uma", "Vince", "Wendy", "Xena", "Yusuf", "Zara",
+]
+_SCALE_LAST_NAMES = [
+    "Doe", "Smith", "Anders", "Baker", "Chen", "Diaz", "Evans", "Farmer", "Gomez", "Hill",
+    "Ibarra", "Jones", "Klein", "Lopez", "Moore", "Nash", "Ortiz", "Perry", "Reyes", "Reed",
+    "Silva", "Tran", "Usher", "Vance", "Ward", "Xu", "Young", "Zimmer",
+]
+
+
+def _scale_typo(name: str) -> str:
+    """A single-vowel substitution -- e.g. "Smith" -> "Smyth" -- deliberately
+    chosen because American Soundex/metaphone codes are built from consonants
+    (after the leading letter); swapping a vowel almost always leaves both
+    codes unchanged, so this reliably produces the "breaks token1, token2/3
+    still agree" case the noisy/twins scenarios below need. Reproduces the
+    original hand-picked "Smith"->"Smyth" example exactly when given "Smith".
+    """
+    subs = {"a": "e", "e": "i", "i": "y", "o": "i", "u": "o", "y": "i"}
+    for i, ch in enumerate(name):
+        lower = ch.lower()
+        if lower in subs:
+            repl = subs[lower].upper() if ch.isupper() else subs[lower]
+            return name[:i] + repl + name[i + 1:]
+    return name + "e"
+
+
+def _build_scaled_scenario(scale: int, n_sites: int, seed: int) -> tuple[dict[str, list[dict]], dict[str, dict[str, str]]]:
+    """Generate a larger, multi-site linkage scenario: `scale` identity-groups
+    (cycling exact / noisy / twins / site-only, same four cases the original
+    5-identity/2-site demo used) spread across `n_sites` independently-keyed
+    sites. Deterministic given `seed`, so re-running produces the same cohort.
+    """
+    if n_sites < 2:
+        raise ValueError("n_sites must be >= 2 to demonstrate cross-site linkage")
+    rng = random.Random(seed)
+    site_names = [f"site_{chr(ord('a') + i)}" for i in range(n_sites)]
+    site_rows: dict[str, list[dict]] = {name: [] for name in site_names}
+    ground_truth: dict[str, dict[str, str]] = {name: {} for name in site_names}
+    counters = {name: 0 for name in site_names}
+    cases = ["exact", "noisy", "twins", "site_only"]
+
+    def add(site: str, patient: dict, label: str) -> None:
+        pid = f"{site.split('_')[-1]}-{counters[site]}"
+        counters[site] += 1
+        site_rows[site].append({**patient, "patient_id": pid})
+        ground_truth[site][pid] = label
+
+    for i in range(scale):
+        first = rng.choice(_SCALE_FIRST_NAMES)
+        last = rng.choice(_SCALE_LAST_NAMES)
+        gender = rng.choice(["F", "M"])
+        birth_date = f"{rng.randint(1950, 2015):04d}-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}"
+        base = {"first_name": first, "last_name": last, "gender": gender, "birth_date": birth_date}
+        site_1, site_2 = rng.sample(site_names, 2)
+        case = cases[i % len(cases)]
+        if case == "exact":
+            label = f"exact_{i}"
+            add(site_1, base, label)
+            add(site_2, base, label)
+        elif case == "noisy":
+            label = f"noisy_{i}"
+            add(site_1, base, label)
+            add(site_2, {**base, "last_name": _scale_typo(last)}, label)
+        elif case == "twins":
+            # Two genuinely different people (label differs) sharing DOB, gender,
+            # last name, and a phonetically-close first name -- every token
+            # agrees despite them being different individuals (see REPORT.md §5.5).
+            add(site_1, base, f"twin_{i}_a")
+            add(site_2, {**base, "first_name": _scale_typo(first)}, f"twin_{i}_b")
+        else:  # site_only -- unique to one site, should never link
+            add(site_1, base, f"solo_{i}")
+
+    return site_rows, ground_truth
+
+
 @app.command("export-linkage-demo-sites")
 def export_linkage_demo_sites(
     central_public_key_path: str = stage6_pprl.DEFAULT_CENTRAL_PUBLIC_KEY,
     inbox_dir: str = "../central/inbox",
     ground_truth_path: str = "../linkage_ground_truth.json",
+    scale: int = 1,
+    n_sites: int = 2,
+    seed: int = 42,
 ):
-    """Simulate two independently-keyed Healthcare Partner sites and export both
+    """Simulate independently-keyed Healthcare Partner sites and export them
     to the central platform's inbox, to demonstrate noisy-identifier linkage
-    (Req 5). Five scenarios, chosen to give recall/precision/F1 something real
-    to measure rather than a trivial 100%/100%:
+    (Req 5).
+
+    With the defaults (`scale=1`, `n_sites=2`) this reproduces the original
+    five-identity, two-site toy scenario byte-for-byte, chosen to give
+    recall/precision/F1 something real to measure rather than a trivial
+    100%/100%:
 
       - exact:  identical spelling at both sites -- the baseline case.
       - noisy:  a last-name typo ("Smith"/"Smyth") -- breaks token1's exact
@@ -96,49 +182,73 @@ def export_linkage_demo_sites(
                 token scheme this coarse: it cannot out-of-the-box distinguish
                 twins. Tests precision -- expect a false positive here.
 
+    `scale` > 1 and/or `n_sites` > 2 instead generates `scale` identity-groups
+    (cycling through the same four cases above) spread across `n_sites`
+    independently-keyed sites, deterministically from `seed` -- for exercising
+    linkage at a larger, more varied cohort size (see `scripts/render_charts.py`).
+
     Also writes `ground_truth_path`, a synthetic-demo-only answer key (which
     patient is which real identity) used purely to score the linkage results
     afterward -- central never sees this file; it plays no role in the actual
     privacy-preserving pipeline.
     """
-    exact = {"first_name": "Jane", "last_name": "Doe", "gender": "F", "birth_date": "1980-05-12"}
-    site_a_only = {"first_name": "Alice", "last_name": "Anders", "gender": "F", "birth_date": "1990-01-01"}
-    site_b_only = {"first_name": "Bob", "last_name": "Baker", "gender": "M", "birth_date": "1985-06-15"}
-    noisy_a = {"first_name": "John", "last_name": "Smith", "gender": "M", "birth_date": "1975-11-03"}
-    noisy_b = {"first_name": "John", "last_name": "Smyth", "gender": "M", "birth_date": "1975-11-03"}
-    twin_a = {"first_name": "Jordan", "last_name": "Doe", "gender": "M", "birth_date": "2001-03-15"}
-    twin_b = {"first_name": "Jorden", "last_name": "Doe", "gender": "M", "birth_date": "2001-03-15"}
+    if scale == 1 and n_sites == 2:
+        exact = {"first_name": "Jane", "last_name": "Doe", "gender": "F", "birth_date": "1980-05-12"}
+        site_a_only = {"first_name": "Alice", "last_name": "Anders", "gender": "F", "birth_date": "1990-01-01"}
+        site_b_only = {"first_name": "Bob", "last_name": "Baker", "gender": "M", "birth_date": "1985-06-15"}
+        noisy_a = {"first_name": "John", "last_name": "Smith", "gender": "M", "birth_date": "1975-11-03"}
+        noisy_b = {"first_name": "John", "last_name": "Smyth", "gender": "M", "birth_date": "1975-11-03"}
+        twin_a = {"first_name": "Jordan", "last_name": "Doe", "gender": "M", "birth_date": "2001-03-15"}
+        twin_b = {"first_name": "Jorden", "last_name": "Doe", "gender": "M", "birth_date": "2001-03-15"}
 
-    # (local_patient_id, patient dict, true-identity label) -- the label is what the
-    # ground-truth file records; two rows sharing a label are truly the same person.
-    site_a_rows = [("a-0", exact, "jane"), ("a-1", noisy_a, "john_smith"),
-                   ("a-2", site_a_only, "alice"), ("a-3", twin_a, "twin_a")]
-    site_b_rows = [("b-0", exact, "jane"), ("b-1", noisy_b, "john_smith"),
-                   ("b-2", site_b_only, "bob"), ("b-3", twin_b, "twin_b")]
+        # (local_patient_id, patient dict, true-identity label) -- the label is what the
+        # ground-truth file records; two rows sharing a label are truly the same person.
+        site_a_rows = [("a-0", exact, "jane"), ("a-1", noisy_a, "john_smith"),
+                       ("a-2", site_a_only, "alice"), ("a-3", twin_a, "twin_a")]
+        site_b_rows = [("b-0", exact, "jane"), ("b-1", noisy_b, "john_smith"),
+                       ("b-2", site_b_only, "bob"), ("b-3", twin_b, "twin_b")]
 
-    def roster(rows: list[tuple[str, dict, str]]) -> list[dict]:
-        return [{**patient, "patient_id": pid} for pid, patient, _label in rows]
+        def roster(rows: list[tuple[str, dict, str]]) -> list[dict]:
+            return [{**patient, "patient_id": pid} for pid, patient, _label in rows]
 
-    path_a = stage6_pprl.export_site_roster(roster(site_a_rows), f"{inbox_dir}/site_a", central_public_key_path)
-    path_b = stage6_pprl.export_site_roster(roster(site_b_rows), f"{inbox_dir}/site_b", central_public_key_path)
+        site_rows = {"site_a": roster(site_a_rows), "site_b": roster(site_b_rows)}
+        # Two rows are a true match iff their labels are equal -- note twin_a/twin_b are
+        # deliberately DIFFERENT labels (they're different real people), even though every
+        # token will treat them as matching. No other bookkeeping needed for that case.
+        ground_truth = {
+            "site_a": {pid: label for pid, _p, label in site_a_rows},
+            "site_b": {pid: label for pid, _p, label in site_b_rows},
+        }
+    else:
+        site_rows, ground_truth = _build_scaled_scenario(scale, n_sites, seed)
 
-    # Two rows are a true match iff their labels are equal -- note twin_a/twin_b are
-    # deliberately DIFFERENT labels (they're different real people), even though every
-    # token will treat them as matching. No other bookkeeping needed for that case.
-    ground_truth = {
-        "site_a": {pid: label for pid, _p, label in site_a_rows},
-        "site_b": {pid: label for pid, _p, label in site_b_rows},
-    }
+    for site_name, rows in site_rows.items():
+        path = stage6_pprl.export_site_roster(rows, f"{inbox_dir}/{site_name}", central_public_key_path)
+        rprint(f"[green]Exported {site_name} ({len(rows)} patients) -> {path}[/green]")
+
     Path(ground_truth_path).write_text(json.dumps(ground_truth, indent=2))
-
-    rprint(f"[green]Exported site_a ({len(site_a_rows)} patients) -> {path_a}[/green]")
-    rprint(f"[green]Exported site_b ({len(site_b_rows)} patients) -> {path_b}[/green]")
     rprint(f"[green]Ground truth (demo-only) -> {ground_truth_path}[/green]")
     rprint("Run `cd ../central && uv run data-counts-central link --ground-truth ../linkage_ground_truth.json`.")
 
     seclog = SecurityAuditLog()
     seclog.log_event(category="administrative_action", name="Linkage demo export", user=_operator,
                       action="export-linkage-demo-sites", resource=inbox_dir, outcome="success")
+
+
+@app.command("tui")
+def tui(
+    work_dir: str = "data/work",
+    review_queue_dir: str = "data/review_queue",
+    outbox_dir: str = "outbox",
+):
+    """Launch the Textual ops console: live run status, DQ panel,
+    review-queue triage, outbox contents, and audit/security log
+    verification -- all read-only over files the pipeline already writes
+    (demo aid, not an RFI-requirement-bearing module).
+    """
+    from .tui import OpsConsoleApp
+
+    OpsConsoleApp(work_dir=work_dir, review_queue_dir=review_queue_dir, outbox_dir=outbox_dir).run()
 
 
 @app.command("verify-logs")
