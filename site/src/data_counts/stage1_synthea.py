@@ -1,22 +1,26 @@
 """Stage 1: synthetic EHR generation + bulk-export endpoint. [Req 1a]
 
-Primary path: shell out to the official MITRE Synthea container image
-(`--use-container`) to generate a FHIR R4 NDJSON cohort. That image is large
-and a 1,000-patient run can take a long time to pull/run, so the default path
-(no flag needed) is a deterministic, seeded, pure-Python FHIR R4 generator
-that emits the same per-resource-type NDJSON shape Synthea's bulk-export
-produces (Patient/Condition/Observation/Encounter/MedicationRequest.ndjson).
-Either way, the output folder is what stage 2 treats as "the bulk-export
-endpoint's payload" — Synthea's own docs note the NDJSON-folder and live
-`$export` paths are interchangeable for a downstream consumer, so this POC
-takes the simpler one by default and documents the container as a drop-in swap.
+Optional path: shell out to the smartonfhir/synthea container image
+(`--use-container`) to generate a real-Synthea FHIR cohort (see the fidelity
+trade-offs documented above `generate_with_container`, notably DSTU3 output,
+not R4). That image is large and a 1,000-patient run can take a long time to
+pull/run, so the default path (no flag needed) is a deterministic, seeded,
+pure-Python FHIR R4 generator that emits the same per-resource-type NDJSON
+shape Synthea's bulk-export produces (Patient/Condition/Observation/Encounter/
+MedicationRequest.ndjson). Either way, the output folder is what stage 2
+treats as "the bulk-export endpoint's payload" — Synthea's own docs note the
+NDJSON-folder and live `$export` paths are interchangeable for a downstream
+consumer, so this POC takes the simpler one by default and documents the
+container as a drop-in swap.
 """
 from __future__ import annotations
 
 import json
+import os
 import random
 import shutil
 import subprocess
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -168,36 +172,118 @@ def resolve_container_engine() -> str | None:
     return None
 
 
-def generate_with_container(out_dir: Path, population: int) -> str | None:
-    """Try the real MITRE Synthea image. Returns the engine used, or None if unavailable."""
+# mitre/synthea (the community image this POC originally shelled out to) has
+# been removed from Docker Hub entirely -- the upstream synthetichealth/synthea
+# project has never published an official container image of its own, only a
+# release jar. smartonfhir/synthea (https://github.com/smart-on-fhir/synthea)
+# is the container image in active-enough use to be worth supporting instead,
+# but it's a thin 2018 Node HTTP wrapper around Synthea's own CLI, not a
+# purpose-built exporter, so three real fidelity trade-offs vs. the old path:
+#   - it only exports FHIR DSTU3 ("stu=3"), not R4 (the fallback generator and
+#     stage 2's schema both target R4; DSTU3 resources still round-trip through
+#     stage 2's generic cumulus-fhir-support ingest, but element shapes for the
+#     same resource type can differ slightly between the two FHIR versions).
+#   - it has no bulk-export mode (no --exporter.fhir.bulk_data equivalent),
+#     only one Bundle-per-patient file, which _bundles_to_ndjson() below splits
+#     into the per-resource-type NDJSON stage 2 expects.
+#   - its HTTP layer (index.js) exposes no seed parameter -- only `-p` gets
+#     forwarded to run_synthea -- so we bypass it and `exec` run_synthea
+#     directly inside the running container with both `-s <seed> -p
+#     <population>` (the App.java entrypoint's own documented flags). This
+#     pins Synthea's *population* seed, which reproduces the same cohort
+#     shape and per-resource-type counts run to run (verified) -- but unlike
+#     the pure-Python path it is not byte-for-byte reproducible: Synthea
+#     draws each resource's id/UUID from unseeded entropy regardless of `-s`.
+SMARTONFHIR_IMAGE = "smartonfhir/synthea"
+
+
+def _wait_for_container(engine: str, name: str, timeout: float = 30) -> bool:
+    """Poll `exec ... true` until the container's process tree is up enough to exec into."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            subprocess.run([engine, "exec", name, "true"], check=True, capture_output=True, timeout=5)
+            return True
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            time.sleep(0.5)
+    return False
+
+
+def _bundles_to_ndjson(bundle_dir: Path, out_dir: Path) -> None:
+    """Split smartonfhir/synthea's one-Bundle-per-patient output into per-resource-type NDJSON."""
+    writers: dict[str, Any] = {}
+    try:
+        for bundle_file in sorted(bundle_dir.glob("*.json")):
+            bundle = json.loads(bundle_file.read_text())
+            for entry in bundle.get("entry", []):
+                resource = entry.get("resource")
+                rt = resource.get("resourceType") if resource else None
+                if rt is None:
+                    continue
+                if rt not in writers:
+                    writers[rt] = (out_dir / f"{rt}.ndjson").open("w")
+                writers[rt].write(json.dumps(resource) + "\n")
+    finally:
+        for w in writers.values():
+            w.close()
+
+
+def generate_with_container(out_dir: Path, population: int, seed: int) -> str | None:
+    """Try the smartonfhir/synthea image. Returns the engine used, or None if unavailable."""
     engine = resolve_container_engine()
     if engine is None:
         return None
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        engine, "run", "--rm",
+    raw_dir = out_dir / "_smartonfhir_raw"
+    if raw_dir.exists():
+        shutil.rmtree(raw_dir)
+    raw_dir.mkdir(parents=True)
+    container_name = f"data-counts-synthea-{os.getpid()}"
+    run_cmd = [
+        engine, "run", "-d", "--rm", "--name", container_name,
         # :Z applies a private SELinux label (needed on the RHEL-family hosts
         # podman is native to, no-op elsewhere). Synthea writes as root inside
         # the container; under rootless podman that lands as the invoking user
         # on the host, so no --userns mapping is needed for this one-shot.
-        "-v", f"{out_dir.resolve()}:/output:Z",
-        "mitre/synthea",
-        "-p", str(population),
-        "--exporter.fhir.export", "true",
-        "--exporter.fhir.bulk_data", "true",
+        "-v", f"{raw_dir.resolve()}:/synthea/output:Z",
+        SMARTONFHIR_IMAGE,
     ]
     try:
-        subprocess.run(cmd, check=True, timeout=1800)
-        return engine
+        subprocess.run(run_cmd, check=True, capture_output=True, timeout=60)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return None
+    try:
+        if not _wait_for_container(engine, container_name):
+            return None
+        # Blocks until run_synthea's process exits inside the container. Real
+        # Synthea's single-threaded JVM generation is roughly linear in
+        # population once JVM/module-load warmup is paid, so the timeout
+        # scales with population (floor covers that fixed warmup cost) rather
+        # than a single constant that's fine at population=5 but too tight at
+        # population=100000.
+        gen_timeout = max(1800, population * 2)
+        subprocess.run(
+            [engine, "exec", container_name, "/synthea/run_synthea", "-s", str(seed), "-p", str(population)],
+            check=True, capture_output=True, timeout=gen_timeout,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        subprocess.run([engine, "stop", container_name], capture_output=True, timeout=30)
+
+    fhir_dir = raw_dir / "fhir"
+    if not fhir_dir.exists():
+        return None
+    _bundles_to_ndjson(fhir_dir, out_dir)
+    shutil.rmtree(raw_dir, ignore_errors=True)
+    return engine
 
 
 def run(out_dir: str | Path = "data/synthea_ndjson", population: int = 1000, seed: int = 42, use_container: bool = False) -> dict[str, Any]:
     out_path = Path(out_dir)
-    engine = generate_with_container(out_path, population) if use_container else None
+    engine = generate_with_container(out_path, population, seed) if use_container else None
     if engine is not None:
-        source = f"mitre/synthea ({engine})"
+        source = f"{SMARTONFHIR_IMAGE} (dstu3, {engine})"
         counts = {rt: sum(1 for _ in (out_path / f"{rt}.ndjson").open()) for rt in RESOURCE_TYPES if (out_path / f"{rt}.ndjson").exists()}
     else:
         counts = generate_synthetic_fallback(out_path, population, seed)

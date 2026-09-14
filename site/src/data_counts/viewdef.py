@@ -17,6 +17,26 @@ from __future__ import annotations
 from typing import Any
 
 
+def _reference_key(ref: str) -> str:
+    """Bare resource id from a FHIR Reference.reference string, any reference form.
+
+    `ResourceType/id` (relative, or an absolute URL ending in it) is the common
+    case `ref.split("/")[-1]` alone used to cover -- but a transaction Bundle
+    (real Synthea's own output, not just this POC's fallback generator) links
+    resources to each other by `urn:uuid:<id>` matching the referenced entry's
+    `fullUrl`, which has no "/" at all, so the old split silently returned the
+    whole "urn:uuid:..." string instead of the id. Confirmed via a real
+    smartonfhir/synthea run: it made getResourceKey() (bare `id`) and
+    getReferenceKey() disagree for every child resource, so stage5_deid's
+    patient-id join found no match and silently excluded ~99% of rows from
+    de-identification (Req 4) -- not a benchmark artifact, a correctness gap
+    any bulk export using urn:uuid: logical references would hit.
+    """
+    if ref.startswith("urn:uuid:"):
+        return ref[len("urn:uuid:"):]
+    return ref.split("/")[-1]
+
+
 def _get_path(obj: Any, path: str) -> Any:
     """Resolve a dotted FHIRPath-lite expression against a parsed resource/element."""
     if path == "getResourceKey()":
@@ -27,7 +47,7 @@ def _get_path(obj: Any, path: str) -> Any:
         if not ref_obj:
             return None
         ref = ref_obj.get("reference") if isinstance(ref_obj, dict) else None
-        return ref.split("/")[-1] if ref else None
+        return _reference_key(ref) if ref else None
 
     cur = obj
     for part in path.split("."):

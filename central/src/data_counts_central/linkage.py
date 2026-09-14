@@ -26,8 +26,11 @@ priors are more defensible than fitting them to a handful of synthetic rows.
 from __future__ import annotations
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import splink.comparison_library as cl
 from splink import DuckDBAPI, Linker, SettingsCreator, block_on
+
+from .ingest import PACKAGE_TOKEN_COLUMNS, TOKEN_COLUMNS
 
 # (m_probability, u_probability) per token, for the "exact match" comparison level.
 # m: P(token matches | truly the same person). u: P(token matches | different people).
@@ -66,10 +69,42 @@ def _build_settings() -> SettingsCreator:
     )
 
 
+def _normalize_for_linkage(table: pa.Table) -> pa.Table:
+    """Make a `resolve_site_package()` output usable by `_build_settings()`.
+
+    `resolve_site_package` deliberately preserves whichever token-column
+    convention the input used (see `ingest._token_columns_of`) -- real site
+    packages (`stage8_package.py`'s output, ingest.PACKAGE_TOKEN_COLUMNS)
+    carry `subject_token1/2/3` and no `local_patient_id` at all (Req 13: no
+    site-internal identifier leaves the site), while the lightweight roster
+    convention (`export_site_roster`, `ingest.TOKEN_COLUMNS`) carries
+    `token1/2/3` plus `local_patient_id`. `_build_settings()` hardcodes the
+    roster's column names, so a real package was never actually linkable
+    through this function -- confirmed by trying it: `Linker` raised a
+    DuckDB "column not found" error for both `token1` and `local_patient_id`
+    on real `stage8_package` output. Fixed here rather than in
+    `_build_settings()` so the Splink settings stay a fixed, simple
+    contract and every caller (real packages and the roster-shaped demo
+    alike) normalizes to it in one place.
+    """
+    names = set(table.column_names)
+    if set(PACKAGE_TOKEN_COLUMNS) <= names:
+        for pkg_col, roster_col in zip(PACKAGE_TOKEN_COLUMNS, TOKEN_COLUMNS):
+            table = table.set_column(table.schema.get_field_index(pkg_col), roster_col, table.column(pkg_col))
+    elif not set(TOKEN_COLUMNS) <= names:
+        raise ValueError(f"table carries neither {TOKEN_COLUMNS} nor {PACKAGE_TOKEN_COLUMNS}; found {sorted(names)}")
+    if "local_patient_id" not in table.column_names:
+        # Splink's own within-run join key only -- never the site-local identifier
+        # Req 13 excludes from real packages, and never persisted past this call.
+        table = table.append_column("local_patient_id", pc.cast(pa.array(range(table.num_rows)), pa.string()))
+    return table
+
+
 def link_resolved_sites(resolved_tables: dict[str, pa.Table]) -> dict:
     """Run Splink over 2+ sites' resolved token tables, cluster matches, and
     return both the raw pairwise predictions and the resulting clusters.
     """
+    resolved_tables = {name: _normalize_for_linkage(t) for name, t in resolved_tables.items()}
     db_api = DuckDBAPI()
     linker = Linker(
         list(resolved_tables.values()),

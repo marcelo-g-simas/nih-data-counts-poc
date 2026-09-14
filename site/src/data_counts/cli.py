@@ -61,7 +61,7 @@ def setup_models():
 
 
 @app.command("stage1-synthea")
-def cli_stage1(out: str = "data/synthea_ndjson", population: int = 1000, seed: int = 42, use_container: bool = False):
+def cli_stage1(out: str = "data/synthea_ndjson", population: int = 1000, seed: int = 42, use_container: bool = True):
     result = stage1_synthea.run(out, population=population, seed=seed, use_container=use_container)
     rprint(result)
 
@@ -158,7 +158,7 @@ def verify_logs(work_dir: str = "data/work"):
 
 
 @app.command("run-all")
-def run_all(drs: str = "drs/examples/DC-POC-0001.json", population: int = 1000):
+def run_all(drs: str = "drs/examples/DC-POC-0001.json", population: int = 1000, use_container: bool = False):
     audit_log = AuditLog()
     seclog = SecurityAuditLog()
     seclog.log_event(category="authentication", name="CLI invocation", user=_operator,
@@ -166,7 +166,7 @@ def run_all(drs: str = "drs/examples/DC-POC-0001.json", population: int = 1000):
     request_id = "unknown"
     try:
         rprint("[bold cyan]Stage 1/9 — Synthea generation[/bold cyan] [dim](Req 1a)[/dim]")
-        s1 = stage1_synthea.run(population=population)
+        s1 = stage1_synthea.run(population=population, use_container=use_container)
         audit_log.record(stage_id="stage1_synthea", batch_id="cohort", record_counts=s1["counts"],
                           outcome="ok", reconciliation_status="n/a")
         total_resources = sum(s1["counts"].values())
