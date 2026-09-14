@@ -141,6 +141,22 @@ def export_linkage_demo_sites(
                       action="export-linkage-demo-sites", resource=inbox_dir, outcome="success")
 
 
+@app.command("tui")
+def tui(
+    work_dir: str = "data/work",
+    review_queue_dir: str = "data/review_queue",
+    outbox_dir: str = "outbox",
+):
+    """Launch the Textual ops console: live run status, DQ panel,
+    review-queue triage, outbox contents, and audit/security log
+    verification -- all read-only over files the pipeline already writes
+    (demo aid, not an RFI-requirement-bearing module).
+    """
+    from .tui import OpsConsoleApp
+
+    OpsConsoleApp(work_dir=work_dir, review_queue_dir=review_queue_dir, outbox_dir=outbox_dir).run()
+
+
 @app.command("verify-logs")
 def verify_logs(work_dir: str = "data/work"):
     """Verify both hash-chained logs (Req 11: "protected against unauthorized

@@ -49,3 +49,11 @@ make test           # both projects' test suites
 See `REQUIREMENTS.md` for the full RFI-requirement-to-module map (and `site/README.md` for the
 site-project subset of it), and `central/README.md` for why Splink is the right tool for turning
 OPPRL's binary tokens into graded match confidence.
+
+## Beyond the pipeline: an operator console
+
+`cd site && data-counts tui` (or `make tui`) launches a [Textual](https://textual.textualize.io/)
+console over a running or completed pipeline: live stage status, DQ results, leak-gate
+review-queue triage, outbox contents, and audit-log tamper verification, all reading the same
+files `make demo` already produces. Run it alongside `make demo` in another terminal to watch the
+run view update as stages complete. See `site/src/data_counts/tui.py`.
