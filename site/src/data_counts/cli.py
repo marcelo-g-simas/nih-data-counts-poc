@@ -12,6 +12,7 @@ import typer
 from rich import print as rprint
 
 from . import (
+    daily_sample,
     stage1_synthea,
     stage2_ingest,
     stage3_drs,
@@ -63,6 +64,19 @@ def setup_models():
 @app.command("stage1-synthea")
 def cli_stage1(out: str = "data/synthea_ndjson", population: int = 1000, seed: int = 42, use_container: bool = True):
     result = stage1_synthea.run(out, population=population, seed=seed, use_container=use_container)
+    rprint(result)
+
+
+@app.command("build-daily-sample")
+def cli_build_daily_sample(
+    ndjson_dir: str = "data/synthea_ndjson_daily",
+    out: str = "data/daily_sample",
+    seed: int = 42,
+    target_patients: int = 10000,
+):
+    """One real encounter (+ class-weighted synthetic note) per patient, re-dated onto
+    a single simulated day -- see daily_sample.py's docstring for why this exists."""
+    result = daily_sample.build(ndjson_dir, out, seed=seed, target_patients=target_patients)
     rprint(result)
 
 

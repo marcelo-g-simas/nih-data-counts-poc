@@ -552,45 +552,51 @@ the equivalent protections actually land.
 
 ## 10. Sizing: baseline, 2X, 5X compute/memory/storage (Req 14)
 
-Req 14 asks for assumed volumes, throughput, and CPU/memory/storage at baseline/2X/5X. Rather than
-assumed volumes, this section anchors "baseline" to a real, published large-academic-health-system
-scale, and derives the rest from **measured** throughput/memory/storage of this actual pipeline
-processing a real cohort through all 9 stages — not a benchmark harness bolted on separately, the
-same stages driven by `run-all` in §2's table.
+Req 14 asks for assumed volumes, throughput, and CPU/memory/storage at baseline/2X/5X. This section
+states the volume assumption directly — a **10,000-patient daily extract** as baseline, 20,000 at
+2X, 50,000 at 5X — and derives throughput/memory/storage from **measured** runs of this actual
+pipeline against real MITRE Synthea output (the `smartonfhir/synthea` container path, not this POC's
+pure-Python placeholder generator), not a projected model built from assumed per-record costs.
 
-The measurement below runs stages 2 through 8 against **real MITRE Synthea output** (11,463
-DSTU3 patients, generated via the `smartonfhir/synthea` container path, not this POC's pure-Python
-placeholder generator). That choice also matters for §10.2's resource-volume model: a real Synthea
-patient's full birth-to-present clinical history carries far more resources per patient than the
-pure-Python generator's deliberately-small bounded ranges do, which changes the volume projection
-materially, not just the throughput numbers.
+### 10.1 The daily-extract sizing unit: 10,000 patients/day
 
-### 10.1 Anchoring "baseline" to a real health system
+What recurs, every day, for the life of a Healthcare Partner's participation, is the incremental
+extract — the volume this section's compute/memory/storage table sizes for, as distinct from the
+one-time bulk-export backfill a partner does once at onboarding (§10.2).
 
-[Emory Healthcare](https://www.emoryhealthcare.org/about/financial-information)
-([FY25 at-a-glance](https://whsc.emory.edu/_includes/documents/sections/publications/fy25-at-a-glance_2025.pdf)) —
-one of the largest academic health systems in the Southeast — reports **7.1 million unique patients
-served**, **5,274,061 patient encounters** and **103,131 hospital admissions** in FY2024, across
-**2,746 licensed beds** and 250 care locations. This POC uses that as the baseline scale rather than
-a round number pulled from nowhere:
+Real Synthea patient histories span decades, not a day — routine-visit vitals and labs compound over
+a patient's whole life, so a one-day extract has to be built by drawing one real encounter per
+patient from their history and placing it on a shared date. `daily_sample.py`'s `build()`
+(`data-counts build-daily-sample`) does this: one real encounter per patient (two for a ~1.5% subset,
+matching the real measured rate of multi-encounter patient-days), re-dated onto one simulated day,
+keeping each encounter's real class and resource content otherwise untouched. One synthetic clinical
+note is attached per encounter (patient-identifier header + templated filler text, length drawn from
+each encounter's real class against two published word-count figures — 642-word median for
+WELLNESS/ambulatory/outpatient/emergency visits, 886-word average for inpatient — weighted by real
+Synthea's own measured class mix, 41.3%/40.6%/12.3%/4.9%/0.9% respectively).
 
-- **Baseline cohort (one-time bulk-export backfill):** 7.1M patients — the full population a
-  Healthcare Partner this size would export once, at onboarding.
-- **Baseline refresh volume (recurring, per the DRS's own `refresh_cadence`):** 5,274,061
-  encounters/year — the annual touch volume a monthly or quarterly refresh cycle (§2's example DRS
-  uses `monthly`) would pull incrementally, not the whole 7.1M every cycle.
-- **2X / 5X:** the RFI's framing is ambiguous between "this many independent Healthcare Partner
-  sites" and "one site at N× volume" — and both are real: Req 5's own architecture (§5) is multiple
-  independently-deployed sites, so 2X/5X most naturally reads as *2 or 5 Emory-scale sites*, each
-  with its own hardware and its own wall-clock at the baseline rate below (linkage is what fans in
-  centrally, not per-site processing time). Where a single site's volume itself grows 2X/5X, the
-  table in §10.4 gives that reading too.
+Run at a 10,000-patient target against a real-Synthea cohort:
 
-### 10.2 From patient count to FHIR resource volume
+| Resource type | Daily volume (baseline, 1 site) |
+|---|---:|
+| Patient | 10,000 |
+| Encounter | 10,149 |
+| Observation | 36,305 |
+| Condition | 2,855 |
+| MedicationRequest | 1,952 |
+| **Total structured resources/day** | **61,261** |
+| Free-text notes/day (1/encounter, avg 648 words) | 10,149 |
 
-Req 1a's cohort is Patient/Condition/Observation/Encounter/MedicationRequest. Real Synthea's
-resource-per-patient ratio, measured on the 11,463-patient cohort above, converts Emory's
-patient/encounter counts into the actual unit the pipeline processes:
+These are direct, measured counts from a real one-day sample — not a ratio applied to an annual or
+lifetime figure. 2X/5X scale these linearly to 20,000/50,000 patients; Req 5's architecture is
+multiple independently-deployed sites, so 2X/5X reads either as one site's daily volume growing, or
+as N independent baseline-scale sites (§10.8 addresses the N-sites reading for `central/`).
+
+### 10.2 One-time bulk-export backfill: from patient count to FHIR resource volume
+
+A Healthcare Partner's one-time onboarding backfill exports each patient's *entire* history, not one
+day — a different, much larger per-patient resource volume than §10.1's daily unit. Real Synthea's
+resource-per-patient ratio, measured on an 11,463-patient full-history cohort:
 
 | Resource type | Measured count (real Synthea, 11,463 patients) | Ratio per patient |
 |---|---:|---:|
@@ -602,35 +608,25 @@ patient/encounter counts into the actual unit the pipeline processes:
 | **Total** | **1,422,672** | **124.11** |
 
 This ratio is ~9× the pure-Python generator's (14.0/patient) — real Synthea simulates a full
-birth-to-present clinical history per patient (routine-visit vitals and labs compound over decades),
-where the placeholder generator draws a handful of encounters from small fixed ranges regardless of
-age. **This is the more defensible number for sizing a real bulk export** — it's what an actual
-patient's accumulated EHR history looks like — so it, not the earlier placeholder-derived figure,
-is what the rest of this section uses.
+birth-to-present clinical history per patient, where the placeholder generator draws a handful of
+encounters from small fixed ranges regardless of age. **This is the more defensible number for
+sizing a real bulk export.**
 
-Applied to Emory's scale:
+A partner's actual backfill scales with their real patient roster: at this measured ratio, an
+N-patient roster backfills to roughly **124.11×N total FHIR resources** (e.g., a 100,000-patient
+roster: ~12.4M resources, ~6.75GB packaged at §10.7's measured 544.30 bytes/resource — 54 seconds on
+a 1 Gbps link, 9 minutes on 100 Mbps). This is a one-time onboarding cost, not part of the recurring
+daily figures in §10.4.
 
-| | Patients | Total FHIR resources |
-|---|---:|---:|
-| Baseline cohort (one-time backfill) | 7,100,000 | **881,180,424** |
-| Baseline refresh (annual, per-encounter ratios) | — | **27,020,660** |
-| Baseline refresh (monthly) | — | 2,251,722 |
-
-(The annual refresh figure uses per-*encounter* ratios, not per-patient — a refresh cycle touches
-encounters that occurred in the window, not the whole historical patient population.)
-
-### 10.3 Measured throughput, this machine
+### 10.3 Measured throughput, this machine (large-scale benchmark)
 
 Hardware: 12-core AMD Ryzen AI 5 PRO 340 laptop, 27GB RAM — the same laptop-scale hardware named
-throughout this report (§9's tokenizer-throughput caveat already flagged this number as
-laptop-measured; this section is that same honesty applied to the whole pipeline, not just
-tokenization). The pipeline is single-process and largely sequential across stages (DuckDB
-parallelizes internally; measured CPU utilization during the run was ~117% of one core, i.e.
-barely more than single-threaded).
+throughout this report. The pipeline is single-process and largely sequential across stages (DuckDB
+parallelizes internally; measured CPU utilization during the run was ~117% of one core, i.e. barely
+more than single-threaded).
 
-Per-stage rate, measured on a 1,422,672-resource / 11,463-patient real-Synthea run, stages 2
-through 8 run directly (not through `stage1_synthea.run()`, to isolate pipeline cost from Synthea's
-own generation cost — see the callout below):
+Per-stage rate, measured on a 1,422,672-resource / 11,463-patient real-Synthea full-history run
+(§10.2's backfill-scale cohort, not the daily-extract sample), stages 2 through 8 run directly:
 
 | Stage | Measured time | Rate |
 |---|---:|---:|
@@ -641,237 +637,197 @@ own generation cost — see the callout below):
 | **End-to-end (stages 2+5+6+8 combined)** | **205.4s** | **55.8 patients/sec** |
 | Peak RSS (single unchunked process, `/usr/bin/time -v`) | **9.83GB** | — |
 
-Stage 7's leak-gate real-batch scan is sub-second at this volume — not because it's free, but
-because this cohort has no free-text notes to scan; §10.7 measures that case separately and it is
-the actual compute driver of §10.5's daily table below, not stages 2/5/6/8.
+This large-scale run is what a real onboarding backfill (§10.2) looks like computationally: at this
+rate, a 100,000-patient backfill's ~12.4M structured resources would take roughly 15 minutes of
+structured-stage compute, single-process, unchunked — well past the point where sharding would
+actually be needed for a much larger roster (§10.5).
 
-**Synthea's own generation time is excluded from the rates above, deliberately** — production
-sizing is about processing an already-exported bulk feed, not regenerating one, and real Synthea's
+Stage 7's leak-gate scan is sub-second at this volume, not because it's free, but because this
+full-history cohort carries no free-text notes to scan — §10.6 measures that case separately, against
+the daily-extract sample, not this backfill-scale one.
+
+**Synthea's own generation time is excluded from the rates above, deliberately** — production sizing
+is about processing an already-exported bulk feed, not regenerating one, and real Synthea's
 generation cost is not even linear in population to begin with: a 2,000-patient calibration run
-generated at ~44 patients/sec, but the 11,463-patient run measured here averaged only ~13.6
-patients/sec. That non-linearity is a property of Synthea's own demo-data generation, not of this
-pipeline's stages, and it's why this section anchors its per-resource rates to a fixed
-~11,463-patient/1.42M-resource measurement rather than trying to regenerate a larger cohort.
+generated at ~44 patients/sec, and an 11,463-patient run averaged only ~13.6 patients/sec. That
+non-linearity is a property of Synthea's own demo-data generation, not of this pipeline's stages.
 
-This ~11,463-patient run is deliberately larger than any single day's real incremental extract
-(§10.4) — it's the unit that establishes the per-resource rates and the memory footprint (9.83GB)
-that §10.4/10.5 scale down from, not the sizing unit itself.
+### 10.4 Compute, memory, and storage at baseline / 2X / 5X (the RFI table)
 
-### 10.4 The sizing unit: daily incremental extracts, not the one-time bulk backfill
+Structured-stage rates measured directly against §10.1's 10,000-patient one-day sample (61,261
+structured resources), not scaled from the different-shaped backfill run in §10.3:
 
-Req 14 asks for baseline/2X/5X compute, memory, and storage. §10.1–10.2 anchor two different
-volumes to Emory's real scale: a **one-time bulk-export backfill** (7.1M patients, the full
-population a Healthcare Partner exports once at onboarding) and a **recurring refresh volume** tied
-to the DRS's own `refresh_cadence`. The backfill is real and does need provisioning once — but it's
-a one-time event, not the multiplier the RFI's baseline/2X/5X framing is actually asking to be sized
-for. What recurs, every day, for the life of a Healthcare Partner's participation, is the
-**incremental extract**, and that — not the backfill — is the volume §10.5's compute/memory/storage
-table uses.
+| Stage | Measured time (baseline) | Rate |
+|---|---:|---:|
+| Ingest (raw Parquet + views) | 7.4s | 8,304 resources/sec |
+| OPPRL tokenization | 5.1s | 1,946 patients/sec |
+| De-identification | 4.8s | 12,663 rows/sec |
+| Package | 0.2s | — |
+| **Structured stages combined** | **17.5s** | — |
+| Peak RSS, structured stages combined | **0.79GB** | measured, `/usr/bin/time -v` |
 
-§10.2's annual-refresh figure (27.0M resources/year, per-encounter ratios) spread evenly across 365
-days gives the daily unit: 5,274,061 annual encounters ÷ 365 ≈ 14,449 encounters/day, and applying
-the same per-encounter resource ratios (§10.2):
+Free-text note scan (§10.6), measured on the same daily sample's notes: **1.255 notes/sec, 819.7
+words/sec**, peak RSS **1.26GB**.
 
-| Resource type | Daily volume (baseline, 1 site) |
-|---|---:|
-| Encounter | 14,449 |
-| Observation | 52,970 |
-| Condition | 3,371 |
-| MedicationRequest | 2,642 |
-| Patient (touches) | 596 |
-| **Total structured resources/day** | **~74,029** |
-
-Req 3/9/13's leak gate (§10.7) also scans free-text notes, at a conservative 1 note/encounter:
-**14,449 notes/day**. (This assumes uniform daily volume; real clinical volume has weekday/weekend
-and seasonal variation a flat annual÷365 average doesn't capture — stated plainly, the same as
-§10.1's Emory anchoring.)
-
-**2X and 5X, applied to this daily unit, read two ways, both real** — the same ambiguity §10.1
-flagged for the bulk backfill applies here too:
-- **A single site's daily volume grows 2X/5X** (more patients served, a busier DRS cadence, or a
-  broader `fhir_view` cohort) — the daily resource/note counts above scale linearly, and §10.5's
-  table gives that reading.
-- **2 or 5 independently-deployed Healthcare Partner sites**, each running its own baseline-scale
-  daily extract — Req 5's own architecture (§5) is multiple independent sites, so each site's
-  per-day compute/memory/storage footprint stays exactly the baseline row of §10.5's table,
-  unchanged, because sites don't share hardware or a trust boundary (Req 13); only `central/`'s
-  fan-in (§10.9) grows with site count.
-
-### 10.5 Compute, memory, and storage at baseline / 2X / 5X (the RFI table)
-
-Built from §10.4's daily unit and this machine's measured rates (§10.3, §10.7):
-
-| | Baseline (74,029 resources + 14,449 notes/day) | 2X (148,058 resources + 28,898 notes/day) | 5X (370,145 resources + 72,245 notes/day) |
+| | Baseline (61,261 resources + 10,149 notes/day) | 2X (122,522 + 20,298) | 5X (306,305 + 50,745) |
 |---|---:|---:|---:|
-| **Compute — structured stages** (ingest+de-id+tokenize+package, §10.3's rates) | ~11 seconds | ~22 seconds | ~55 seconds |
-| **Compute — note scan, single-threaded** (§10.7's 0.991 notes/sec) | 4.05 hours | 8.10 hours | 20.25 hours |
-| **Compute — note scan, ~4.65-way parallel** (12 cores ÷ ~2.6 cores/worker measured) | **52 minutes** | **1.74 hours** | **4.35 hours** |
-| **Memory, peak** (estimated — see below) | ~1.8GB | ~2.3GB | ~3.8GB |
-| **Storage — total daily growth** (1,941 bytes/resource, §10.2) | 137MB/day | 274MB/day | 685MB/day |
-| **Storage — site-side lake, steady state at 90-day retention** | 11.7GB | 23.4GB | 58.5GB |
-| **Transmitted `outbox/` package/day** (57.5 bytes/resource, measured, §10.8) | 4.06MB | 8.12MB | 20.3MB |
+| **Compute — structured stages** | ~18 seconds | ~35 seconds | ~88 seconds |
+| **Compute — note scan** | 2.25 hours | 4.49 hours | 11.23 hours |
+| **Memory, peak** | ~1.26GB | ~1.26GB | ~1.26GB |
+| **Storage — site-local lake growth** (464.73 bytes/resource, measured) | 28.5MB/day | 56.9MB/day | 142.3MB/day |
+| **Storage — site-local lake, steady state at 90-day retention** | 2.56GB | 5.12GB | 12.81GB |
+| **Transmitted `outbox/` package/day** (544.30 bytes/resource, measured) | 33.3MB/day | 66.7MB/day | 166.7MB/day |
 
-Reading the table: at daily scale, none of this stresses a single Healthcare Partner site's
-hardware — even 5X's note-scan figure (4.35 hours, parallel) comfortably fits a nightly batch
-window, and memory never leaves single-digit gigabytes. That's a direct consequence of the sizing
-unit: a day's incremental extract is roughly two orders of magnitude smaller than the
-~11,463-patient/1.42M-resource run §10.3 measured end to end (9.83GB peak RSS) — small enough that
-no sharding, no multi-node cluster, and no >100GB server is needed to run the recurring job this
-RFI's multipliers actually describe. **For the N-independent-sites reading, the baseline column is
-each site's number, unchanged at 2X/5X** — a busier or additional site doesn't make any one site's
-daily job larger; it just means more sites are each independently running the baseline row.
+Reading the table: at daily scale, the structured stages and storage never stress a single Healthcare
+Partner site's hardware — structured-stage compute stays under two minutes even at 5X, and daily
+storage growth stays in the tens-to-low-hundreds of megabytes. **For the N-independent-sites reading,
+the baseline column is each site's number, unchanged at 2X/5X** — a busier or additional site doesn't
+make any one site's daily job larger; it just means more sites are each independently running the
+baseline row.
 
-**Memory is estimated, not separately measured at daily scale:** scaling §10.3's measured 9.83GB
-peak RSS (11,463-patient/1.42M-resource run) proportionally to each row's daily resource count gives
-the structured-stage share (~0.5GB baseline, ~1GB at 2X, ~2.5GB at 5X), and §10.7's measured 1.28GB
-note-scanner peak RSS is added as a roughly constant, model-weight-dominated cost regardless of note
-volume — giving the ~1.8GB / ~2.3GB / ~3.8GB totals above. Nothing here contradicts §10.3/10.7's
-finding that stage 7 is compute-bound, not memory-bound — daily-cadence sizing is a CPU/scheduling
-question (does the note-scan finish inside the nightly window), not a RAM-provisioning one.
+**The note-scan row is the compute driver, and the one that stops fitting comfortably at scale.**
+Baseline (2.25 hours) and 2X (4.49 hours) fit an overnight batch window; **5X (11.23 hours) is close
+to a full day**, not a comfortably nightly job, on this one node's single-threaded rate.
 
-### 10.6 What this sizing does and does not claim
+**Memory is dominated by the note-scan stage's one loaded model copy (1.26GB), not by resource
+volume** — the structured-stage peak (0.79GB) is smaller and, since the pipeline runs its stages
+sequentially in one process, the overall peak at any scale in this table is the note-scanner's figure,
+not the sum of the two. Memory was never the binding constraint here at any of these three volumes.
+
+**Storage — transmitted package is larger per resource than site-local lake growth (544.30 vs 464.73
+bytes/resource), which looks backwards at first — the outbox's tokenized columns carry three
+RSA-OAEP-encrypted values per row, and encrypted ciphertext doesn't compress, while the site-local
+lake's raw lossless layer is repetitive real-world FHIR JSON (shared code systems, boilerplate
+structure) that Parquet's columnar compression handles well.** Both figures are real, directly
+measured against the same 61,261-resource sample, not estimates.
+
+### 10.5 What this sizing does and does not claim
 
 - **These are real measurements of this POC's actual code against real Synthea output** (§10.3,
-  §10.7), scaled arithmetically to §10.1's Emory-anchored daily rate — not a projected model built
-  from assumed per-record costs. A production deployment's actual per-record cost will still differ
-  with real (non-synthetic) data shapes, real storage backends, and real hardware.
-- **The daily-extract framing in §10.4–10.5 is the basis for this RFI's baseline/2X/5X multipliers,
-  in place of the one-time bulk backfill.** The backfill number (§10.1–10.2, 881M resources at
-  Emory's baseline scale) is still real and still needs provisioning once, at onboarding — but it's
-  a one-time cost, not a recurring load, and it isn't what the daily figures above are sizing.
-- **Sharding remains necessary for the one-time bulk backfill, not for daily operation.** Fully
-  reprocessing a 7.1M-patient onboarding export in one unchunked run would need the shard-and-
-  parallelize approach this POC's stages don't implement today (`stage2_ingest.py`/
-  `stage5_deid.py`/`stage6_pprl.py` each load a working set into memory per stage, not a
-  streamed/chunked read) — but the recurring daily job in §10.5 never approaches a scale where that
-  matters.
+  §10.4, §10.6), not a projected model built from assumed per-record costs. A production deployment's
+  actual per-record cost will still differ with real (non-synthetic) data shapes, real storage
+  backends, and real hardware.
+- **10,000 patients/day is a stated assumption, not derived from a published health system's
+  volume.** Req 14 asks for "assumed volumes" explicitly; this section states its assumption plainly
+  rather than deriving one from an external source.
+- **Sharding remains necessary for a large one-time bulk backfill, not for daily operation.** §10.3's
+  100,000-patient backfill illustration is well within what this POC's unchunked stages handle in
+  minutes; a much larger roster would eventually need the shard-and-parallelize approach this POC's
+  stages don't implement today (`stage2_ingest.py`/`stage5_deid.py`/`stage6_pprl.py` each load a
+  working set into memory per stage, not a streamed/chunked read) — but the recurring daily job in
+  §10.4 never approaches a scale where that matters.
 - **Retention is prescribed, not implemented.** No stage in this repo prunes `data/lake/` by age
   (`grep -rn retention site/src/data_counts/` finds nothing); the 90-day steady-state figures in
-  §10.5 are the sizing conclusion a retention/pruning job (keyed on `refresh_id` or ingest
-  timestamp) would need to realize, not a feature that exists today. The *outbox* package is
-  arguably not what a 90-day retention policy would even target — it's the transmitted deliverable,
-  not a working cache, and Req 8/15's snapshot/refresh-id history (`stage8_package.py`) has its own
-  reasons to be kept longer than 90 days for reconciliation.
-- **The free-text scan is now part of the baseline daily figure**, not a footnote left out of it
-  (§10.5) — the note volume/length behind it still comes from published research, not measured
-  production note text (§10.7's methodology), so a real note corpus's true PHI density and note-type
-  mix would still move the exact hours in §10.5's note-scan rows, though not their order of
-  magnitude.
-- **The 2,746-bed / 103,131-admission figures were not used in this projection** — they describe
-  Emory's *inpatient* capacity, whereas the resource-volume model (§10.2) is driven by patients and
-  encounters, which include the much larger outpatient/ambulatory volume this pipeline's cohort-wide
-  DRS-driven export actually handles. They're reported for context, not because this model is
-  admissions-driven.
+  §10.4 are the sizing conclusion a retention/pruning job (keyed on `refresh_id` or ingest timestamp)
+  would need to realize, not a feature that exists today.
+- **The free-text scan's note volume/length assumption comes from published research, not measured
+  production note text** (§10.6's methodology) — a real note corpus's true PHI density and note-type
+  mix would still move the exact hours in §10.4's note-scan row, though not its order of magnitude
+  (NLP inference measured in notes/sec, not thousands of resources/sec like the structured stages).
 
-### 10.7 The cost of scanning real free-text notes (Req 3, 9, 13)
+### 10.6 The cost of scanning real free-text notes (Req 3, 9, 13)
 
-Stage 7's leak gate (Presidio + Philter + GLiNER, Req 3/9/13) is the compute driver behind §10.5's
-note-scan rows. `stage7_leak_gate.run()` takes a `note_text` field neither Synthea nor this POC's
+Stage 7's leak gate (Presidio + Philter + GLiNER, Req 3/9/13) is the compute driver behind §10.4's
+note-scan row. `stage7_leak_gate.run()` takes a `note_text` field neither Synthea nor this POC's
 pure-Python fallback populates, so measuring its real cost requires actually giving it text to scan.
 
 **Methodology.** Real clinical note volume/length has no equivalent in this repo's own data to
-measure directly, so the length and per-encounter volume assumptions come from published research —
-the same anchoring approach §10.1 used for Emory's scale:
-- **Length:** outpatient progress notes averaged 401 words in 2009, rising to a 642-word median by
-  2018 at one academic medical center ([Rule et al., PMC8290305](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8290305/));
-  inpatient progress notes averaged 886 words in a separate study
-  ([PMC8529482](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8529482/)).
+measure directly, so the length and per-encounter volume assumptions come from published research:
+- **Length, weighted by real encounter class:** outpatient progress notes averaged 401 words in 2009,
+  rising to a 642-word median by 2018 at one academic medical center
+  ([Rule et al., PMC8290305](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8290305/)); inpatient
+  progress notes averaged 886 words in a separate study
+  ([PMC8529482](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8529482/)). Real Synthea's own
+  encounter-class mix (measured on 26,803 encounters: 41.3% WELLNESS, 40.6% ambulatory, 12.3%
+  outpatient, 4.9% emergency, 0.9% inpatient) means the 642-word outpatient figure is the right anchor
+  for nearly all of it; this section weights each sampled encounter's note length by its real `class`
+  (no ED-specific published figure was found, so outpatient is used as a stated placeholder for that
+  4.9%; 886 words applies to the 0.9% that are inpatient).
 - **Volume:** conservatively **1 note per encounter**. This almost certainly *undercounts* — the same
   research found a median of 359 notes per ED encounter by 2022, driven by copy-forward documentation
   ([Adler-Milstein et al., PMC11110617](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC11110617/)) — but
   a defensible floor is more useful here than a number this section can't source as precisely.
 
-**Measurement.** One synthetic note per encounter (patient-identifier header + templated clinical
-filler sentences, averaging 848 words/note — in the published range above by construction) was
-merged into an actual real-Synthea cohort sized to §10.4's daily target: 683 patients, 15,619
-encounters, 77,057 structured resources, with each note's header pulling the *real* linked patient's
-name/DOB/phone via the real `urn:uuid:` encounter→patient reference, not a random unlinked identity.
-Running the full pipeline, stages 2 through 8, end to end on that composite: structured stages
-finished in under 11 seconds combined (ingest 13,541 resources/sec, de-identification 16,838
-rows/sec — in line with §10.3). Stage 7, scanning a timed 1,000-note sample of the merged set with
-all three detectors as `run()` actually invokes them: **0.991 notes/sec, 857 words/sec**, at ~258%
-CPU (the combined detector pipeline uses ~2.6 cores per note scanned, mostly spaCy/GLiNER inference,
-not just Presidio's regex layer), peak RSS **1.28GB** — a text-NLP workload that is compute-bound
-here, not memory-bound, unlike stages 2/5/6. Every note in the sample correctly triggered a halt, as
-expected since the corpus deliberately embeds an identifier header per note to force real NER work —
-production output (already de-identified before stage 7 sees it) should not be expected to trigger
-one this often. This is the rate §10.5's note-scan rows are built from.
+**Measurement.** §10.1's daily sample (10,000 patients, 10,149 encounters, one real encounter per
+patient re-dated onto a single simulated day) has one synthetic note attached per encounter, each
+note's header pulling the *real* linked patient's name/DOB/phone via the real encounter→patient
+reference, not a random unlinked identity. Full-corpus average length: 648.4 words/note. Scanning a
+timed 1,000-note sample with all three detectors as `run()` actually invokes them (sample averaged
+653.0 words/note, consistent with the full corpus): **1.255 notes/sec, 819.7 words/sec**, peak RSS
+**1.26GB**. Every note in the sample correctly triggered a halt, as expected since the corpus
+deliberately embeds an identifier header per note to force real NER work — production output (already
+de-identified before stage 7 sees it) should not be expected to trigger one this often. This is the
+rate §10.4's note-scan row is built from.
 
-**Caveats, stated as plainly as §10.6's:** this is one measurement on synthetic, deliberately
+**Caveats, stated as plainly as §10.5's:** this is one measurement on synthetic, deliberately
 identifier-dense text, on one machine, with one detector configuration — a production note corpus's
-true PHI density, note-type mix (nursing notes are typically far shorter than discharge summaries),
-and GLiNER/Presidio tuning would all move the real number, though the order of magnitude (NLP
-inference measured in notes/sec, not thousands of resources/sec like stages 2/5/6) is unlikely to
-change.
+true PHI density and note-type mix (nursing notes are typically far shorter than discharge summaries)
+would move the real number, though the order of magnitude (NLP inference measured in notes/sec, not
+thousands of resources/sec like the structured stages) is unlikely to change.
 
 **No GPU anywhere in this figure, or in this pipeline.** The measurement above ran on this laptop's
 CPU alone, and that isn't a limitation of the test — it's the module's own design:
 `stage7_leak_gate.py`'s docstring is explicit that GLiNER runs through `fast_gliner` (Rust + ONNX
 Runtime, CPU-only), Presidio is spaCy-backed, and Philter is regex/POS-based — "no vLLM or any
-generative-LLM serving stack anywhere." §10.5's note-scan hours are ordinary CPU-core hours, not GPU
+generative-LLM serving stack anywhere." §10.4's note-scan hours are ordinary CPU-core hours, not GPU
 hours: standard compute VMs, procurable at any cloud provider or on-prem, not the specialized (and
 typically 5-15× more expensive per core-hour) GPU instances an LLM-based PHI scanner would require.
 The whole pipeline — Req 14's compute story end to end, stage 7 included — is sized for a CPU-only
 VM by design, matching Req 12a's minimal-attack-surface framing: no GPU driver stack, no CUDA
 runtime, one fewer class of host dependency to patch and secure.
 
-### 10.8 Upload time: what actually crosses the wire
+### 10.7 Upload time: what actually crosses the wire
 
 Req 13's "only de-identified, tokenized output is transmitted" is architecturally load-bearing here:
 `stage8_package.py` packages only the five structured domain tables (Req 1a's cohort), and this
 pipeline has no transmission path for free-text notes at all — the leak gate exists to catch PHI that
-has leaked *into a structured field*, not to clear narrative text for transmission, and §10.7's
-notes never appear anywhere in `outbox/`. So the transmitted volume is the packaged `outbox/`, not
-`data/lake/` (§10.5's site-local retention window) and not the note corpus.
+has leaked *into a structured field*, not to clear narrative text for transmission, and §10.6's notes
+never appear anywhere in `outbox/`. So the transmitted volume is the packaged `outbox/`, not
+`data/lake/` (§10.4's site-local retention window) and not the note corpus.
 
-**Measured, not assumed:** §10.7's real day-sized composite (683 patients, 77,057 resources)
-produced an actual `outbox/` package of **4,429,300 bytes — 57.5 bytes/resource** (a real packaged
-Parquet+manifest deliverable, in the same ballpark as the 53.8 bytes/resource an earlier
-11,463-patient real-Synthea run's package independently measured). This is the rate §10.5's
+**Measured, not assumed:** running the full structured pipeline against §10.1's 10,000-patient daily
+sample (61,261 resources) produced an actual `outbox/` package of **33,344,595 bytes — 544.30
+bytes/resource** — a real packaged Parquet+manifest deliverable. This is the rate §10.4's
 transmitted-package row uses.
 
 **Transfer time at the daily scale**, at three site-egress tiers (nominal link speed × 70% effective
-throughput, a simplifying allowance for TLS/protocol overhead — not a measurement, an assumption
-stated plainly like §10.1's Emory anchoring):
+throughput, a simplifying allowance for TLS/protocol overhead — not a measurement, a stated
+assumption):
 
 | | 100 Mbps (small site) | 1 Gbps (typical enterprise site) | 10 Gbps (large AMC backbone) |
 |---|---:|---:|---:|
-| Baseline (4.06 MB/day) | <1s | <1s | <1s |
-| 2X (8.12 MB/day) | <1s | <1s | <1s |
-| 5X (20.3 MB/day) | 1.6s | <1s | <1s |
+| Baseline (33.3 MB/day) | 3.2s | <1s | <1s |
+| 2X (66.7 MB/day) | 6.3s | <1s | <1s |
+| 5X (166.7 MB/day) | 15.9s | 1.6s | <1s |
 
-Daily transmission is trivial at any realistic bandwidth, at any of the 2X/5X readings — the
-packaged output is small precisely because the raw lake's `__source_json` and nested structure (§2,
-§10.5) never leave the site; only flat tokenized columns do. Transmission was never going to be this
-pipeline's bottleneck at daily cadence; §10.5/§10.7's note-scan compute (minutes to hours, depending
-on scale) dominates every one of these figures by orders of magnitude.
+Daily transmission stays well under a minute at any realistic bandwidth, at any of the 2X/5X
+readings — the packaged output is small precisely because the raw lake's `__source_json` and nested
+structure (§2, §10.4) never leave the site; only flat tokenized columns do. Transmission was never
+going to be this pipeline's bottleneck at daily cadence; §10.4/§10.6's note-scan compute (hours,
+depending on scale) dominates every one of these figures by orders of magnitude.
 
-(The one-time onboarding backfill — §10.1–10.2's 881M-resource, 7.1M-patient bulk export — is a
-separate, larger transfer: ~47.2GB at Emory's baseline scale, 1.53 hours on a 100 Mbps link or 9.2
-minutes at 1 Gbps. It's a real one-time cost worth planning the onboarding week around, but it isn't
-the recurring load the daily figures above, and §10.5's multiplier table, are sized for.)
+(§10.2's one-time onboarding backfill is a separate, larger transfer, scaling with the partner's
+actual roster size at the same 544.30 bytes/resource rate — see §10.2's illustrative example.)
 
 No stage in this repo actually performs a network transfer (the outbound path is a local `outbox/`
-directory standing in for it, per `REQUIREMENTS.md`'s Req 12 row), so this section, like §10.1's
-Emory anchoring, is sizing math applied to a real measured artifact, not a benchmark of a real
-network call.
+directory standing in for it, per `REQUIREMENTS.md`'s Req 12 row), so this section is sizing math
+applied to a real measured artifact, not a benchmark of a real network call.
 
-### 10.9 Does the 2X/5X multiplier apply to the central platform?
+### 10.8 Does the 2X/5X multiplier apply to the central platform?
 
-Everything through §10.8 sized one Healthcare Partner site's *daily* job. `central/` — the Data
+Everything through §10.7 sized one Healthcare Partner site's *daily* job. `central/` — the Data
 COUNTS program's own platform — is a structurally different thing, and the RFI's baseline/2X/5X
 framing doesn't map onto it the same way.
 
 **There is no "API container" to replicate, yet.** `grep -rn fastapi central/` finds nothing;
-`central/`'s three real operations (token resolution, date re-offset, linkage) are Typer CLI
-commands invoked as batch jobs (`central/src/data_counts_central/cli.py`), not a running service.
-This matches `REQUIREMENTS.md`'s own Req 15 gap note — the Program API is `architecture-only`. So the
-question as posed has a premise to correct first: today's real deployment shape is a scheduled
-batch ingest+linkage job, not a service that could be scaled by adjusting a replica count.
+`central/`'s three real operations (token resolution, date re-offset, linkage) are Typer CLI commands
+invoked as batch jobs (`central/src/data_counts_central/cli.py`), not a running service. This matches
+`REQUIREMENTS.md`'s own Req 15 gap note — the Program API is `architecture-only`. So the question as
+posed has a premise to correct first: today's real deployment shape is a scheduled batch
+ingest+linkage job, not a service that could be scaled by adjusting a replica count.
 
 **Central's real per-day cost is the sum of what every site sends it, and at daily scale that sum
-stays small.** Measured directly against §10.7's real day-sized composite package (683-patient,
-77,057-resource, real RSA/AES keys):
+stays small.** Measured per-operation rates (real RSA/AES keys):
 
 | Operation | Measured rate | Peak RSS | Parallelism model |
 |---|---:|---:|---|
@@ -879,21 +835,22 @@ stays small.** Measured directly against §10.7's real day-sized composite packa
 | `reoffset_domain_tables` (per-row date-shift delta) | 4,943 rows/sec | 232MB | **Embarrassingly parallel** — same property, per row |
 | `link_resolved_sites` (Splink/DuckDB, cross-site link_only run) | 11,479 rows/sec at this scale | 200MB | **Not arbitrary-replica-friendly** — see below |
 
-Applied to §10.4's daily unit, fanning in from N independently-deployed sites each sending their own
-baseline day:
+These per-operation rates are properties of the crypto/dedup code itself (cost per token, per row),
+not of the daily sample's patient/encounter mix, so they carry over directly to §10.1's 10,000-patient
+baseline. Applied to §10.1's daily unit, fanning in from N independently-deployed sites each sending
+their own baseline day:
 
 | | 1 site (baseline) | 2 sites | 5 sites |
 |---|---:|---:|---:|
-| Patient touches/day (resolve workload) | 596 | 1,192 | 2,980 |
-| **`resolve_site_package` time** | 0.6s | 1.2s | 3.0s |
-| Structured resources/day (re-offset workload) | 74,029 | 148,058 | 370,145 |
-| **`reoffset_domain_tables` time** | 15.0s | 30.0s | 74.9s |
-| **`link_resolved_sites` time**, comparing that day's arrivals | 0.05s | 0.10s | 0.26s |
+| Patient touches/day (resolve workload) | 10,000 | 20,000 | 50,000 |
+| **`resolve_site_package` time** | 10.0s | 20.0s | 50.0s |
+| Structured resources/day (re-offset workload) | 61,261 | 122,522 | 306,305 |
+| **`reoffset_domain_tables` time** | 12.4s | 24.8s | 62.0s |
+| **`link_resolved_sites` time**, comparing that day's arrivals | 0.87s | 1.74s | 4.36s |
 
-At daily-increment scale, central's resolve/re-offset/link workload never leaves single-digit
-seconds regardless of site count — the two stateless operations are trivially absorbed by
-proportionally more replicas if it ever mattered, and even cross-site linkage of a single day's
-arrivals is cheap.
+At daily-increment scale, central's resolve/re-offset/link workload never leaves single-digit seconds
+regardless of site count — the two stateless operations are trivially absorbed by proportionally more
+replicas if it ever mattered, and even cross-site linkage of a single day's arrivals is cheap.
 
 **The real constraint linkage has is about the cumulative pool, not the daily increment, and it
 doesn't disappear at this scale.** Splink blocks candidate pairs on `token2` (soundex) —
@@ -903,18 +860,16 @@ would match can be compared only if they land in the same partition, so replicas
 run at scale, must be sharded by blocking-key value, not routed arbitrarily, or true cross-site
 matches get silently missed. That constraint is invisible at the daily-increment scale in the table
 above, because each day's new arrivals are small relative to any one blocking-key partition — but it
-reappears the moment central builds or re-derives its full cumulative pool (the one-time onboarding
-backfill, §10.1–10.2's Emory-scale numbers, or a full re-link after a schema change), where
-blocking-key partition size grows with the *combined* pool of every site's resolved tokens, and
-comparison cost within a partition can grow worse than linearly with partition size. Splink's own
-architecture reflects exactly this: its Spark backend exists specifically to distribute
-blocking-group comparison work, and `central/` deliberately doesn't use it (DuckDB only,
-single-process, per its own module docstring).
+reappears the moment central builds or re-derives its full cumulative pool (a one-time onboarding
+backfill or a full re-link after a schema change), where blocking-key partition size grows with the
+*combined* pool of every site's resolved tokens, and comparison cost within a partition can grow
+worse than linearly with partition size. Splink's own architecture reflects exactly this: its Spark
+backend exists specifically to distribute blocking-group comparison work, and `central/` deliberately
+doesn't use it (DuckDB only, single-process, per its own module docstring).
 
 **So: the daily-increment multiplier is trivial for central; the real central sizing question is the
 one-time (or periodic full-rebuild) cumulative-pool linkage, which needs deliberate
 blocking-key-aware sharding (or Splink's Spark backend), not uniform replication.** A stateless
 ingest/resolve/re-offset tier that scales linearly with daily site count, plus a linkage tier whose
-real cost driver is cumulative pool size rather than any one day's increment — a two-tier
-deployment, not a one-size answer, and not the same shape as the site-side daily sizing in
-§10.4–10.5.
+real cost driver is cumulative pool size rather than any one day's increment — a two-tier deployment,
+not a one-size answer, and not the same shape as the site-side daily sizing in §10.1–10.4.
